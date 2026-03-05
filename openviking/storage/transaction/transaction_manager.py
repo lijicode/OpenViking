@@ -557,7 +557,7 @@ class TransactionManager:
 
 
 def init_transaction_manager(
-    agfs_config: Any,
+    agfs: AGFSClient,
     tx_timeout: int = 3600,
     max_parallel_locks: int = 8,
     lock_timeout: float = 0.0,
@@ -566,7 +566,7 @@ def init_transaction_manager(
     """Initialize transaction manager singleton.
 
     Args:
-        agfs_config: AGFS configuration (url, timeout, etc.)
+        agfs: AGFS client instance
         tx_timeout: Transaction timeout in seconds (default: 3600)
         max_parallel_locks: Maximum number of parallel lock operations (default: 8)
         lock_timeout: Path lock acquisition timeout in seconds.
@@ -584,16 +584,9 @@ def init_transaction_manager(
             logger.debug("TransactionManager already initialized")
             return _transaction_manager
 
-        # Get AGFS URL from config
-        agfs_url = getattr(agfs_config, "url", "http://localhost:8080")
-        agfs_timeout = getattr(agfs_config, "timeout", 10)
-
-        # Create AGFS client
-        agfs_client = AGFSClient(api_base_url=agfs_url, timeout=agfs_timeout)
-
         # Create transaction manager
         _transaction_manager = TransactionManager(
-            agfs_client=agfs_client,
+            agfs_client=agfs,
             timeout=tx_timeout,
             max_parallel_locks=max_parallel_locks,
             lock_timeout=lock_timeout,
