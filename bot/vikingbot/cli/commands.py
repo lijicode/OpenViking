@@ -561,7 +561,7 @@ def chat(
         None, "--config", "-c", help="Path to ov.conf, default .openviking/ov.conf"
     ),
 ):
-
+    """Interact with the agent directly."""
     path = Path(config_path).expanduser() if config_path is not None else None
 
     bus = MessageBus()
@@ -580,7 +580,6 @@ def chat(
     )
 
     logger.remove()
-    import os
 
     log_file = get_data_dir() / f"vikingbot.debug.{os.getpid()}.log"
     logger.add(

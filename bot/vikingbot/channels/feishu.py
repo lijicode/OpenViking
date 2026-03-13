@@ -172,8 +172,9 @@ class FeishuChannel(BaseChannel):
 
         # Handle failed response
         if not response.success():
+            raw_detail = getattr(getattr(response, 'raw', None), 'content', response.msg)
             raise Exception(
-                f"Failed to download image: code={response.code}, msg={response.raw.content}, log_id={response.get_log_id()}"
+                f"Failed to download image: code={response.code}, msg={raw_detail}, log_id={response.get_log_id()}"
             )
 
         # Read the image bytes from the response file
@@ -757,6 +758,7 @@ class FeishuChannel(BaseChannel):
                         if at_id == bot_open_id:
                             is_mentioned = True
                             break
+                        continue
                     # 兼容其他可能的ID格式
                     at_id = getattr(mention, 'id', '') or getattr(mention, 'user_id', '')
                     if at_id == f"app_{bot_app_id}" or at_id == bot_app_id:
