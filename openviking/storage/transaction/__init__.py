@@ -13,6 +13,7 @@ from openviking.storage.transaction.transaction_manager import (
     TransactionManager,
     get_transaction_manager,
     init_transaction_manager,
+    reset_transaction_manager,
 )
 from openviking.storage.transaction.transaction_record import (
     TransactionRecord,
@@ -31,4 +32,5 @@ __all__ = [
     "execute_rollback",
     "get_transaction_manager",
     "init_transaction_manager",
+    "reset_transaction_manager",
 ]

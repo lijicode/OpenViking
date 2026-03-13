@@ -100,7 +100,7 @@ class TransactionManager:
 
         logger.info("TransactionManager started")
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Stop transaction manager.
 
         Stops the background cleanup task and releases all resources.
@@ -114,11 +114,17 @@ class TransactionManager:
         # Cancel cleanup task
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
             self._cleanup_task = None
 
-        # Release all active transactions
+        # Release all active transactions' locks
         for tx_id in list(self._transactions.keys()):
-            self._transactions.pop(tx_id, None)
+            tx = self._transactions.pop(tx_id, None)
+            if tx:
+                await self._path_lock.release(tx)
 
         logger.info("TransactionManager stopped")
 
@@ -508,14 +514,16 @@ class TransactionManager:
         src_path: str,
         dst_path: str,
         timeout: Optional[float] = None,
+        src_is_dir: bool = True,
     ) -> bool:
         """Acquire path lock for mv operation.
 
         Args:
             transaction_id: Transaction ID
-            src_path: Source directory path
+            src_path: Source path
             dst_path: Destination parent directory path
             timeout: Maximum time to wait for each lock in seconds (default: from config)
+            src_is_dir: Whether the source is a directory
 
         Returns:
             True if lock acquired successfully, False otherwise
@@ -528,7 +536,7 @@ class TransactionManager:
         tx.update_status(TransactionStatus.AQUIRE)
         effective_timeout = timeout if timeout is not None else self._lock_timeout
         success = await self._path_lock.acquire_mv(
-            src_path, dst_path, tx, timeout=effective_timeout
+            src_path, dst_path, tx, timeout=effective_timeout, src_is_dir=src_is_dir
         )
 
         if success:
@@ -603,3 +611,15 @@ def get_transaction_manager() -> Optional[TransactionManager]:
         TransactionManager instance or None if not initialized
     """
     return _transaction_manager
+
+
+def reset_transaction_manager() -> None:
+    """Reset the transaction manager singleton (for testing).
+
+    This function should ONLY be used in tests to clean up state between tests.
+    It clears the global singleton instance without performing cleanup - make sure
+    to call stop() first if the manager is still running.
+    """
+    global _transaction_manager
+    with _lock:
+        _transaction_manager = None

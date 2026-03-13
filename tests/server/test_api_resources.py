@@ -5,8 +5,6 @@
 
 import httpx
 
-from tests.server.conftest import SAMPLE_MD_CONTENT
-
 
 async def test_add_resource_success(client: httpx.AsyncClient, sample_markdown_file):
     resp = await client.post(
@@ -55,7 +53,7 @@ async def test_add_resource_with_target(client: httpx.AsyncClient, sample_markdo
         "/api/v1/resources",
         json={
             "path": str(sample_markdown_file),
-            "target": "viking://resources/custom/",
+            "to": "viking://resources/custom/sample",
             "reason": "test resource",
         },
     )

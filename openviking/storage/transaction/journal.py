@@ -10,8 +10,7 @@ detected and recovered after a process restart.
 import json
 from typing import Any, Dict, List
 
-from pyagfs import AGFSClient
-
+from openviking.pyagfs import AGFSClient
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)

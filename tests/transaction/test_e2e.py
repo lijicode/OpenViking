@@ -24,8 +24,8 @@ def tx_manager(agfs_client):
         agfs_client=agfs_client,
         timeout=3600,
         max_parallel_locks=8,
-        lock_timeout=5.0,
-        lock_expire=300.0,
+        lock_timeout=1.0,
+        lock_expire=1.0,
     )
     return manager
 

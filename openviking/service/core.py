@@ -307,7 +307,7 @@ class OpenVikingService:
     async def close(self) -> None:
         """Close OpenViking and release resources."""
         if self._transaction_manager:
-            self._transaction_manager.stop()
+            await self._transaction_manager.stop()
             self._transaction_manager = None
 
         if self._vikingdb_manager:

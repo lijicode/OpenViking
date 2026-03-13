@@ -51,7 +51,7 @@ class TestAddResource:
         """Test adding resource to specified target"""
         result = await client.add_resource(
             path=str(sample_markdown_file),
-            target="viking://resources/custom/",
+            to="viking://resources/custom/sample",
             reason="Test resource",
         )
 

@@ -36,12 +36,14 @@ class TransactionContext:
         lock_paths: List[str],
         lock_mode: str = "point",
         mv_dst_path: Optional[str] = None,
+        src_is_dir: bool = True,
     ):
         self._tx_manager = tx_manager
         self._operation = operation
         self._lock_paths = lock_paths
         self._lock_mode = lock_mode
         self._mv_dst_path = mv_dst_path
+        self._src_is_dir = src_is_dir
         self._record: Optional[TransactionRecord] = None
         self._committed = False
         self._sequence = 0
@@ -81,7 +83,10 @@ class TransactionContext:
             if len(self._lock_paths) < 1 or not self._mv_dst_path:
                 raise TransactionError("mv lock mode requires lock_paths[0] and mv_dst_path")
             success = await self._tx_manager.acquire_lock_mv(
-                tx_id, self._lock_paths[0], self._mv_dst_path
+                tx_id,
+                self._lock_paths[0],
+                self._mv_dst_path,
+                src_is_dir=self._src_is_dir,
             )
         else:
             # "point" mode (default)

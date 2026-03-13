@@ -245,9 +245,21 @@ class QueueManager:
 
             await asyncio.sleep(self._poll_interval)
 
-        # Drain remaining in-flight tasks on shutdown
+        # Drain remaining in-flight tasks on shutdown (with timeout)
         if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[QueueManager] Drain timeout for {queue.name}, "
+                    f"cancelling {len(active_tasks)} in-flight task(s)"
+                )
+                for t in active_tasks:
+                    t.cancel()
+                await asyncio.gather(*active_tasks, return_exceptions=True)
 
     def stop(self) -> None:
         """Stop QueueManager and release resources."""
@@ -258,8 +270,10 @@ class QueueManager:
         # Stop queue workers
         for stop_event in self._queue_stop_events.values():
             stop_event.set()
-        for thread in self._queue_threads.values():
-            thread.join()
+        for name, thread in self._queue_threads.items():
+            thread.join(timeout=10.0)
+            if thread.is_alive():
+                logger.warning(f"[QueueManager] Worker thread {name} did not exit in time")
         self._queue_threads.clear()
         self._queue_stop_events.clear()
 

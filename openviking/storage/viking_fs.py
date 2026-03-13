@@ -324,9 +324,10 @@ class VikingFS:
     ) -> Dict[str, Any]:
         """Move file/directory + recursively update vector index.
 
-        Wrapped in a transaction: performs FS mv first, then VectorDB URI update.
-        On rollback, the file is moved back and VectorDB mappings are restored.
+        Implemented as cp + rm to avoid lock files being carried by FS mv.
+        On rollback, the copy is deleted and the source remains intact.
         """
+        from openviking.pyagfs.helpers import cp as agfs_cp
         from openviking.storage.transaction import TransactionContext, get_transaction_manager
 
         self._ensure_access(old_uri, ctx)
@@ -350,30 +351,43 @@ class VikingFS:
                     logger.info(f"[VikingFS] mv source not found, cleaned orphan index: {old_uri}")
                 raise
 
-        # Verify source exists before locking
+        # Verify source exists and determine type before locking
         try:
-            self.agfs.stat(old_path)
+            stat = self.agfs.stat(old_path)
+            is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
         except Exception:
             raise FileNotFoundError(f"mv source not found: {old_uri}")
 
-        # Lock source and destination's parent (dst doesn't exist yet)
         dst_parent = new_path.rsplit("/", 1)[0] if "/" in new_path else new_path
 
         async with TransactionContext(
-            tx_manager, "mv", [old_path], lock_mode="mv", mv_dst_path=dst_parent
+            tx_manager,
+            "mv",
+            [old_path],
+            lock_mode="mv",
+            mv_dst_path=dst_parent,
+            src_is_dir=is_dir,
         ) as tx:
-            # Step 1: FS move
-            seq_mv = tx.record_undo("fs_mv", {"src": old_path, "dst": new_path})
+            # Step 1: Copy source to destination
+            seq_cp = tx.record_undo("fs_write_new", {"uri": new_path})
             try:
-                result = self.agfs.mv(old_path, new_path)
-            except AGFSHTTPError as e:
-                if e.status_code == 404:
+                agfs_cp(self.agfs, old_path, new_path, recursive=is_dir)
+            except Exception as e:
+                if "not found" in str(e).lower():
                     await self._delete_from_vector_store(uris_to_move, ctx=ctx)
                     logger.info(f"[VikingFS] mv source not found, cleaned orphan index: {old_uri}")
                 raise
-            tx.mark_completed(seq_mv)
+            tx.mark_completed(seq_cp)
 
-            # Step 2: Update VectorDB URIs
+            # Step 2: Remove carried lock file from the copy (directory only)
+            if is_dir:
+                carried_lock = new_path.rstrip("/") + "/.path.ovlock"
+                try:
+                    self.agfs.rm(carried_lock)
+                except Exception:
+                    pass
+
+            # Step 3: Update VectorDB URIs
             old_uri_stripped = old_uri.rstrip("/")
             old_parent_uri = (
                 old_uri_stripped.rsplit("/", 1)[0] + "/" if "/" in old_uri_stripped else ""
@@ -390,8 +404,13 @@ class VikingFS:
             await self._update_vector_store_uris(uris_to_move, old_uri, new_uri, ctx=ctx)
             tx.mark_completed(seq_vdb)
 
+            # Step 4: Remove source (lock file gets deleted along with it)
+            seq_rm = tx.record_undo("fs_rm", {"uri": old_path, "recursive": is_dir})
+            self.agfs.rm(old_path, recursive=is_dir)
+            tx.mark_completed(seq_rm)
+
             await tx.commit()
-            return result
+            return {}
 
     async def grep(
         self,
@@ -1380,6 +1399,12 @@ class VikingFS:
         """
         self._ensure_access(uri, ctx)
         path = self._uri_to_path(uri, ctx=ctx)
+        # Verify the file exists before reading, because AGFS read returns
+        # empty bytes for non-existent files instead of raising an error.
+        try:
+            self.agfs.stat(path)
+        except Exception:
+            raise NotFoundError(uri, "file")
         try:
             content = self.agfs.read(path)
         except Exception:

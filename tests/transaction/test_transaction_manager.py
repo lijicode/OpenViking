@@ -283,20 +283,20 @@ class TestLifecycle:
         await manager.start()
         await manager.start()  # Should not error
         assert manager._running is True
-        manager.stop()
+        await manager.stop()
 
     async def test_stop_clears_state(self):
         manager, _ = _make_manager()
         await manager.start()
         manager.create_transaction()
-        manager.stop()
+        await manager.stop()
         assert manager._running is False
         assert manager.get_transaction_count() == 0
 
     async def test_stop_idempotent(self):
         manager, _ = _make_manager()
-        manager.stop()
-        manager.stop()  # Should not error
+        await manager.stop()
+        await manager.stop()  # Should not error
 
 
 class TestTimeoutCleanup:
