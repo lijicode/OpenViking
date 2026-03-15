@@ -11,8 +11,26 @@ from openviking.models.embedder.base import (
     EmbedResult,
     HybridEmbedderBase,
     SparseEmbedderBase,
+    exponential_backoff_retry,
     truncate_and_normalize,
 )
+from openviking_cli.utils.logger import default_logger as logger
+
+
+def is_429_error(exception: Exception) -> bool:
+    """
+    判断异常是否为 429 限流错误
+
+    Args:
+        exception: 要检查的异常
+
+    Returns:
+        如果是 429 错误则返回 True，否则返回 False
+    """
+    exception_str = str(exception)
+    return (
+        "429" in exception_str or "TooManyRequests" in exception_str or "RateLimit" in exception_str
+    )
 
 
 def process_sparse_embedding(sparse_data: Any) -> Dict[str, float]:
@@ -89,7 +107,10 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
             raise ValueError("api_key is required")
 
         # Initialize Volcengine client
-        self.client = volcenginesdkarkruntime.Ark(api_key=self.api_key, base_url=self.api_base)
+        ark_kwargs = {"api_key": self.api_key}
+        if self.api_base:
+            ark_kwargs["base_url"] = self.api_base
+        self.client = volcenginesdkarkruntime.Ark(**ark_kwargs)
 
         # Auto-detect dimension
         self._dimension = dimension
@@ -116,7 +137,8 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
         Raises:
             RuntimeError: When API call fails
         """
-        try:
+
+        def _embed_call():
             if self.input_type == "multimodal":
                 # Use multimodal embeddings API
                 response = self.client.multimodal_embeddings.create(
@@ -130,6 +152,17 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
 
             vector = truncate_and_normalize(vector, self.dimension)
             return EmbedResult(dense_vector=vector)
+
+        try:
+            return exponential_backoff_retry(
+                _embed_call,
+                max_wait=10.0,
+                base_delay=0.5,
+                max_delay=2.0,
+                jitter=True,
+                is_retryable=is_429_error,
+                logger=logger,
+            )
         except Exception as e:
             raise RuntimeError(f"Volcengine embedding failed: {str(e)}") from e
 
@@ -164,6 +197,9 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
                 for item in data
             ]
         except Exception as e:
+            logger.error(
+                f"Volcengine batch embedding failed, texts length: {len(texts)}, input_type: {self.input_type}, model_name: {self.model_name}"
+            )
             raise RuntimeError(f"Volcengine batch embedding failed: {str(e)}") from e
 
     def get_dimension(self) -> int:
@@ -202,7 +238,10 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
         if not self.api_key:
             raise ValueError("api_key is required")
 
-        self.client = volcenginesdkarkruntime.Ark(api_key=self.api_key, base_url=self.api_base)
+        ark_kwargs = {"api_key": self.api_key}
+        if self.api_base:
+            ark_kwargs["base_url"] = self.api_base
+        self.client = volcenginesdkarkruntime.Ark(**ark_kwargs)
 
     def embed(self, text: str) -> EmbedResult:
         """Perform sparse embedding on text
@@ -216,16 +255,28 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
         Raises:
             RuntimeError: When API call fails
         """
-        try:
+
+        def _embed_call():
             # Must use multimodal endpoint for sparse
             response = self.client.multimodal_embeddings.create(
                 input=[{"type": "text", "text": text}],
                 model=self.model_name,
                 sparse_embedding={"type": "enabled"},
             )
-            item = response.data[0]
+            item = response.data
             sparse_vector = getattr(item, "sparse_embedding", None)
             return EmbedResult(sparse_vector=process_sparse_embedding(sparse_vector))
+
+        try:
+            return exponential_backoff_retry(
+                _embed_call,
+                max_wait=10.0,
+                base_delay=0.5,
+                max_delay=2.0,
+                jitter=True,
+                is_retryable=is_429_error,
+                logger=logger,
+            )
         except Exception as e:
             raise RuntimeError(f"Volcengine sparse embedding failed: {str(e)}") from e
 
@@ -243,18 +294,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
         """
         if not texts:
             return []
-        try:
-            multimodal_inputs = [{"type": "text", "text": text} for text in texts]
-            response = self.client.multimodal_embeddings.create(
-                input=multimodal_inputs, model=self.model_name, sparse_embedding={"type": "enabled"}
-            )
-            results = []
-            for item in response.data:
-                sparse_vector = getattr(item, "sparse_embedding", None)
-                results.append(EmbedResult(sparse_vector=process_sparse_embedding(sparse_vector)))
-            return results
-        except Exception as e:
-            raise RuntimeError(f"Volcengine batch sparse embedding failed: {str(e)}") from e
+        return [self.embed(text) for text in texts]
 
 
 class VolcengineHybridEmbedder(HybridEmbedderBase):
@@ -295,7 +335,10 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
         if not self.api_key:
             raise ValueError("api_key is required")
 
-        self.client = volcenginesdkarkruntime.Ark(api_key=self.api_key, base_url=self.api_base)
+        ark_kwargs = {"api_key": self.api_key}
+        if self.api_base:
+            ark_kwargs["base_url"] = self.api_base
+        self.client = volcenginesdkarkruntime.Ark(**ark_kwargs)
         self._dimension = dimension or 2048
 
     def embed(self, text: str) -> EmbedResult:
@@ -310,7 +353,8 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
         Raises:
             RuntimeError: When API call fails
         """
-        try:
+
+        def _embed_call():
             # Always use multimodal for hybrid to get both
 
             response = self.client.multimodal_embeddings.create(
@@ -324,6 +368,17 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
 
             return EmbedResult(
                 dense_vector=dense_vector, sparse_vector=process_sparse_embedding(sparse_vector)
+            )
+
+        try:
+            return exponential_backoff_retry(
+                _embed_call,
+                max_wait=10.0,
+                base_delay=0.5,
+                max_delay=2.0,
+                jitter=True,
+                is_retryable=is_429_error,
+                logger=logger,
             )
         except Exception as e:
             raise RuntimeError(f"Volcengine hybrid embedding failed: {str(e)}") from e
@@ -342,24 +397,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
         """
         if not texts:
             return []
-        try:
-            multimodal_inputs = [{"type": "text", "text": text} for text in texts]
-            response = self.client.multimodal_embeddings.create(
-                input=multimodal_inputs, model=self.model_name, sparse_embedding={"type": "enabled"}
-            )
-            results = []
-            for item in response.data:
-                dense_vector = truncate_and_normalize(item.embedding, self.dimension)
-                sparse_vector = getattr(item, "sparse_embedding", None)
-                results.append(
-                    EmbedResult(
-                        dense_vector=dense_vector,
-                        sparse_vector=process_sparse_embedding(sparse_vector),
-                    )
-                )
-            return results
-        except Exception as e:
-            raise RuntimeError(f"Volcengine batch hybrid embedding failed: {str(e)}") from e
+        return [self.embed(text) for text in texts]
 
     def get_dimension(self) -> int:
         return self._dimension

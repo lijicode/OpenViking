@@ -35,17 +35,17 @@ from vikingbot.config.schema import FeishuChannelConfig
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
+        CreateMessageRequest,
+        CreateMessageRequestBody,
         Emoji,
-        P2ImMessageReceiveV1,
+        GetChatRequest,
         GetImageRequest,
         GetMessageResourceRequest,
+        P2ImMessageReceiveV1,
         ReplyMessageRequest,
-        ReplyMessageRequestBody,
-        GetChatRequest,
+        ReplyMessageRequestBody
     )
 
     FEISHU_AVAILABLE = True
@@ -77,6 +77,16 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    # 飞书官方支持的处理中表情列表，按顺序发送
+    PROCESSING_EMOJIS = [
+        "StatusInFlight",
+        "OneSecond",
+        "Typing",
+        "OnIt",
+        "Coffee",
+        "OnIt",
+        "EatingFood",
+    ]
 
     def __init__(self, config: FeishuChannelConfig, bus: MessageBus, **kwargs):
         super().__init__(config, bus, **kwargs)
@@ -162,8 +172,9 @@ class FeishuChannel(BaseChannel):
 
         # Handle failed response
         if not response.success():
+            raw_detail = getattr(getattr(response, 'raw', None), 'content', response.msg)
             raise Exception(
-                f"Failed to download image: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+                f"Failed to download image: code={response.code}, msg={raw_detail}, log_id={response.get_log_id()}"
             )
 
         # Read the image bytes from the response file
@@ -310,6 +321,20 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
 
+    async def send_processing_reaction(self, message_id: str, emoji: str) -> None:
+        """
+        Send processing reaction emoji implementation for Feishu.
+        """
+        await self._add_reaction(message_id, emoji)
+
+    async def handle_processing_tick(self, message_id: str, tick_count: int) -> None:
+        """
+        Handle processing tick event, send corresponding emoji reaction.
+        """
+        if 0 <= tick_count < len(self.PROCESSING_EMOJIS):
+            emoji = self.PROCESSING_EMOJIS[tick_count]
+            await self.send_processing_reaction(message_id, emoji)
+
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
         r"((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
@@ -326,7 +351,10 @@ class FeishuChannel(BaseChannel):
         lines = [l.strip() for l in table_text.strip().split("\n") if l.strip()]
         if len(lines) < 3:
             return None
-        split = lambda l: [c.strip() for c in l.strip("|").split("|")]
+
+        def split(l: str) -> list[str]:
+            return [c.strip() for c in l.strip("|").split("|")]
+
         headers = split(lines[0])
         rows = [split(l) for l in lines[2:]]
         columns = [
@@ -384,7 +412,6 @@ class FeishuChannel(BaseChannel):
             before = protected[last_end : m.start()].strip()
             if before:
                 elements.append({"tag": "markdown", "content": before})
-            level = len(m.group(1))
             text = m.group(2).strip()
             elements.append(
                 {
@@ -466,6 +493,9 @@ class FeishuChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu."""
+        # 先调用基类处理通用动作
+        if await super().send(msg):
+            return
 
         if not self._client:
             logger.warning("Feishu client not initialized")
@@ -476,6 +506,7 @@ class FeishuChannel(BaseChannel):
             return
 
         try:
+            # logger.info(f"Sending message {msg}")
             # Determine receive_id_type based on chat_id format
             # open_id starts with "ou_", chat_id starts with "oc_"
             reply_to = msg.metadata.get("reply_to")
@@ -487,23 +518,7 @@ class FeishuChannel(BaseChannel):
             # Process images and get cleaned content
             cleaned_content, images = await self._extract_and_upload_images(msg.content)
 
-            # Process @mentions: convert @ou_xxxx to Feishu mention format
-            # Pattern: @ou_xxxxxxx (user open_id)
-            import re
-
-            mention_pattern = r"@(ou_[a-zA-Z0-9_-]+)"
-
-            def replace_mention(match):
-                open_id = match.group(1)
-                return f'<at user_id="{open_id}">@{open_id}</at>'
-
-            # Replace all mentions
-            content_with_mentions = re.sub(mention_pattern, replace_mention, cleaned_content)
-
-            # Also support @all mention
-            content_with_mentions = content_with_mentions.replace(
-                "@all", '<at user_id="all">所有人</at>'
-            )
+            content_with_mentions = cleaned_content
 
             # Check if we need to reply to a specific message
             # Get reply message ID from metadata (original incoming message ID)
@@ -644,10 +659,7 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type  # "p2p" or "group"
             msg_type = message.message_type
 
-            # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "MeMeMe")
-
-            # Parse message content and media
+            # Parse message content and media first to check mentions
             content = ""
             media = []
 
@@ -703,7 +715,6 @@ class FeishuChannel(BaseChannel):
                             image_bytes = await self._download_feishu_image(image_key, message_id)
                             if image_bytes:
                                 # Save to workspace/media directory
-                                from pathlib import Path
 
                                 media_dir = get_data_path() / "received"
 
@@ -733,7 +744,54 @@ class FeishuChannel(BaseChannel):
 
             import re
 
+            # 检查是否@了机器人
+            is_mentioned = False
             mention_pattern = re.compile(r"@_user_\d+")
+            bot_open_id = self.config.open_id
+            bot_app_id = self.config.app_id
+
+            # 优先从message的mentions字段提取@信息（text和post类型都适用）
+            if hasattr(message, 'mentions') and message.mentions and bot_open_id:
+                for mention in message.mentions:
+                    if hasattr(mention, 'id') and hasattr(mention.id, 'open_id'):
+                        at_id = mention.id.open_id
+                        if at_id == bot_open_id:
+                            is_mentioned = True
+                            break
+                        continue
+                    # 兼容其他可能的ID格式
+                    at_id = getattr(mention, 'id', '') or getattr(mention, 'user_id', '')
+                    if at_id == f"app_{bot_app_id}" or at_id == bot_app_id:
+                        is_mentioned = True
+                        break
+
+            # 话题群@检查逻辑
+            should_process = True
+            if chat_type == "group":
+                chat_mode = await self._get_chat_mode(chat_id)
+                if chat_mode == "thread":
+                    # 判断是否是话题的首条消息（root_id等于message_id说明是话题发起消息）
+                    is_topic_starter = message.root_id == message.message_id or not message.root_id
+
+                    if self.config.thread_require_mention:
+                        # 模式1：默认True，所有消息都需要@才处理
+                        if not is_mentioned:
+                            logger.info(f"Skipping thread message: thread_require_mention is True and not mentioned")
+                            should_process = False
+                    else:
+                        # 模式2：False，仅话题首条消息不需要@，后续回复需要@
+                        if not is_topic_starter and not is_mentioned:
+                            logger.info(f"Skipping thread message: not topic starter and not mentioned")
+                            should_process = False
+
+            # 不需要处理的消息直接跳过
+            if not should_process:
+                return
+
+            # 确认需要处理后再添加"已读"表情
+            await self._add_reaction(message_id, "MeMeMe")
+
+            # 替换所有@占位符
             content = mention_pattern.sub(f"@{sender_id}", content)
 
             # Forward to message bus
@@ -745,7 +803,7 @@ class FeishuChannel(BaseChannel):
                 chat_mode = await self._get_chat_mode(chat_id)
                 if chat_mode == "thread" and not message.root_id:
                     message.root_id = message.message_id
-                if message.root_id:
+                if chat_mode == "thread" and message.root_id:
                     chat_id = f"{reply_to}#{message.root_id}"
             await self._handle_message(
                 sender_id=sender_id,
@@ -762,8 +820,8 @@ class FeishuChannel(BaseChannel):
                 },
             )
 
-        except Exception as e:
-            logger.exception(f"Error processing Feishu message")
+        except Exception:
+            logger.exception("Error processing Feishu message")
 
     async def _extract_and_upload_images(self, content: str) -> tuple[str, list[dict]]:
         """Extract images from markdown content, upload to Feishu, and return cleaned content."""

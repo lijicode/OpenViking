@@ -535,6 +535,14 @@ configure_openviking_conf() {
       "input": "multimodal"
     }
   },
+  "log": {
+    "level": "WARNING",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "output": "file",
+    "rotation": true,
+    "rotation_days": 3,
+    "rotation_interval": "midnight"
+  },
   "vlm": {
     "provider": "volcengine",
     "api_key": ${vlm_api_json},
@@ -561,6 +569,7 @@ download_plugin() {
     "examples/openclaw-memory-plugin/openclaw.plugin.json"
     "examples/openclaw-memory-plugin/package.json"
     "examples/openclaw-memory-plugin/package-lock.json"
+    "examples/openclaw-memory-plugin/tsconfig.json"
     "examples/openclaw-memory-plugin/.gitignore"
   )
   local total=${#files[@]}
@@ -611,21 +620,20 @@ configure_openclaw_plugin() {
     oc_env=(env OPENCLAW_STATE_DIR="$OPENCLAW_DIR")
   fi
 
-  "${oc_env[@]}" openclaw config set plugins.enabled true
-  "${oc_env[@]}" openclaw config set plugins.allow '["memory-openviking"]' --json
-  "${oc_env[@]}" openclaw config set gateway.mode local
-  "${oc_env[@]}" openclaw config set plugins.slots.memory memory-openviking
-  "${oc_env[@]}" openclaw config set plugins.load.paths "[\"${PLUGIN_DEST}\"]" --json
-  "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.mode "${SELECTED_MODE}"
-  "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.targetUri viking://user/memories
-  "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.autoRecall true --json
-  "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.autoCapture true --json
+  # Enable plugin (files already deployed to extensions dir by deploy_plugin)
+  "${oc_env[@]}" openclaw plugins enable memory-openviking || { err "$(tr "openclaw plugins enable failed" "openclaw 插件启用失败")"; exit 1; }
 
+  # Set gateway mode
+  "${oc_env[@]}" openclaw config set gateway.mode local
+
+  # Set plugin config for the selected mode
   if [[ "$SELECTED_MODE" == "local" ]]; then
-    local config_path="${OPENVIKING_DIR}/ov.conf"
-    "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.configPath "${config_path}"
+    local ov_conf_path="${OPENVIKING_DIR}/ov.conf"
+    "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.mode local
+    "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.configPath "${ov_conf_path}"
     "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.port "${SELECTED_SERVER_PORT}"
   else
+    "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.mode remote
     "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.baseUrl "${remote_base_url}"
     if [[ -n "${remote_api_key}" ]]; then
       "${oc_env[@]}" openclaw config set plugins.entries.memory-openviking.config.apiKey "${remote_api_key}"

@@ -4,9 +4,7 @@ import asyncio
 import json
 import os
 import select
-import signal
 import sys
-import hashlib
 import time
 from pathlib import Path
 
@@ -31,16 +29,15 @@ from vikingbot.cron.service import CronService
 from vikingbot.cron.types import CronJob
 from vikingbot.heartbeat.service import HeartbeatService
 from vikingbot.integrations.langfuse import LangfuseClient
-from vikingbot.config.loader import load_config
 
 # Create sandbox manager
 from vikingbot.sandbox.manager import SandboxManager
 from vikingbot.session.manager import SessionManager
 from vikingbot.utils.helpers import (
+    get_bridge_path,
+    get_history_path,
     get_source_workspace_path,
     set_bot_data_path,
-    get_history_path,
-    get_bridge_path,
 )
 
 app = typer.Typer(
@@ -237,6 +234,7 @@ def gateway(
         True, "--agent/--no-agent", help="Enable agent loop for OpenAPI/chat"
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    config_path: str = typer.Option(None, "--config", "-c", help="ov.conf path"),
 ):
     """Start the vikingbot gateway with OpenAPI chat enabled by default."""
 
@@ -246,7 +244,8 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     bus = MessageBus()
-    config = ensure_config()
+    path = Path(config_path).expanduser() if config_path is not None else None
+    config = ensure_config(path)
     _init_bot_data(config)
     session_manager = SessionManager(config.bot_data_path)
 
@@ -471,6 +470,7 @@ async def start_console(console_port):
     """Start the console web UI in a separate thread within the same process."""
     try:
         import threading
+
         from vikingbot.console.console_gradio_simple import run_console_server
 
         def run_in_thread():
@@ -509,6 +509,7 @@ def prepare_agent_channel(
     markdown: bool,
     logs: bool,
     eval: bool = False,
+    sender: str | None = None,
 ):
     """Prepare channel for agent command."""
     from vikingbot.channels.chat import ChatChannel, ChatChannelConfig
@@ -526,6 +527,7 @@ def prepare_agent_channel(
             session_id=session_id,
             markdown=markdown,
             eval=eval,
+            sender=sender,
         )
         channels.add_channel(channel)
     else:
@@ -538,6 +540,7 @@ def prepare_agent_channel(
             session_id=session_id,
             markdown=markdown,
             logs=logs,
+            sender=sender,
         )
         channels.add_channel(channel)
 
@@ -557,19 +560,18 @@ def chat(
     eval: bool = typer.Option(
         False, "--eval", "-e", help="Run evaluation mode, output JSON results"
     ),
+    config_path: str = typer.Option(
+        None, "--config", "-c", help="Path to ov.conf, default .openviking/ov.conf"
+    ),
+    sender: str = typer.Option(
+        None, "--sender", help="Sender ID, same usage as feishu channel sender"
+    ),
 ):
     """Interact with the agent directly."""
-    if message is not None:
-        # Single-turn mode: only show error logs
-        logger.remove()
-        logger.add(sys.stderr, level="ERROR")
-    elif logs:
-        logger.enable("vikingbot")
-    else:
-        logger.disable("vikingbot")
+    path = Path(config_path).expanduser() if config_path is not None else None
 
     bus = MessageBus()
-    config = ensure_config()
+    config = ensure_config(path)
     _init_bot_data(config)
     session_manager = SessionManager(config.bot_data_path)
 
@@ -578,10 +580,28 @@ def chat(
     if session_id is None:
         session_id = get_or_create_machine_id()
     cron = prepare_cron(bus, quiet=is_single_turn)
-    channels = prepare_agent_channel(config, bus, message, session_id, markdown, logs, eval)
+    channels = prepare_agent_channel(config, bus, message, session_id, markdown, logs, eval, sender)
     agent_loop = prepare_agent_loop(
         config, bus, session_manager, cron, quiet=is_single_turn, eval=eval
     )
+
+    logger.remove()
+
+    log_file = get_data_dir() / f"vikingbot.debug.{os.getpid()}.log"
+    logger.add(
+        log_file,
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
+    )
+
+    if logs:
+        logger.add(sys.stderr, level="DEBUG")
+    else:
+        logger.add(sys.stderr, level="ERROR")
 
     async def run():
         if is_single_turn:
@@ -788,8 +808,6 @@ def cron_list(
     table.add_column("Schedule")
     table.add_column("Status")
     table.add_column("Next Run")
-
-    import time
 
     for job in jobs:
         # Format schedule

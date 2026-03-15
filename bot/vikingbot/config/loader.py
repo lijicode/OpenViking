@@ -7,6 +7,7 @@ from typing import Any
 from loguru import logger
 from vikingbot.config.schema import Config
 
+CONFIG_PATH = None
 
 def get_config_path() -> Path:
     """Get the path to ov.conf config file.
@@ -38,9 +39,11 @@ def get_data_dir() -> Path:
     return get_data_path()
 
 
-def ensure_config():
+def ensure_config(config_path: Path | None = None) -> Config:
     """Ensure ov.conf exists, create with default bot config if not."""
-    config_path = get_config_path()
+    config_path = config_path or get_config_path()
+    global CONFIG_PATH
+    CONFIG_PATH = config_path
 
     if not config_path.exists():
         logger.info("Config not found, creating default config...")
@@ -50,14 +53,14 @@ def ensure_config():
 
         # Create default config with empty bot section
         default_config = Config()
-        save_config(default_config, config_path)
+        save_config(default_config, config_path, include_defaults=True)
         logger.info(f"[green]✓[/green] Created default config at {config_path}")
 
-    config = load_config(config_path)
+    config = load_config()
     return config
 
 
-def load_config(config_path: Path | None = None) -> Config:
+def load_config() -> Config:
     """
     Load configuration from ov.conf's bot field, and merge vlm config for model.
 
@@ -67,7 +70,7 @@ def load_config(config_path: Path | None = None) -> Config:
     Returns:
         Loaded configuration object.
     """
-    path = config_path or get_config_path()
+    path = CONFIG_PATH or get_config_path()
 
     if path.exists():
         try:
@@ -128,6 +131,8 @@ def _merge_vlm_model_config(bot_data: dict, vlm_data: dict) -> None:
         bot_data["agents"]["provider"] = provider if provider else ""
         bot_data["agents"]["api_base"] = vlm_data.get("api_base", "")
         bot_data["agents"]["api_key"] = vlm_data.get("api_key", "")
+        if "extra_headers" in vlm_data and vlm_data["extra_headers"] is not None:
+            bot_data["agents"]["extra_headers"] = vlm_data["extra_headers"]
 
 
 def _merge_ov_server_config(bot_data: dict, ov_data: dict) -> None:
@@ -140,19 +145,22 @@ def _merge_ov_server_config(bot_data: dict, ov_data: dict) -> None:
         bot_data["server_url"] = f"http://{host}:{port}"
     if "root_api_key" not in bot_data or not bot_data["root_api_key"]:
         bot_data["root_api_key"] = ov_data.get("root_api_key", "")
-    if "root_api_key" in ov_data and ov_data["root_api_key"]:
+    if "root_api_key" in bot_data and bot_data["root_api_key"]:
         bot_data["mode"] = "remote"
     else:
         bot_data["mode"] = "local"
 
 
-def save_config(config: Config, config_path: Path | None = None) -> None:
+def save_config(
+    config: Config, config_path: Path | None = None, include_defaults: bool = False
+) -> None:
     """
     Save configuration to ov.conf's bot field, preserving other sections.
 
     Args:
         config: Configuration to save.
         config_path: Optional path to ov.conf file. Uses default if not provided.
+        include_defaults: Whether to include default values in the saved config.
     """
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +175,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             pass
 
     # Update bot section - only save fields that were explicitly set
-    bot_data = config.model_dump(exclude_unset=True)
+    bot_data = config.model_dump(exclude_unset=not include_defaults)
     if bot_data:
         full_data["bot"] = convert_to_camel(bot_data)
     else:

@@ -155,24 +155,28 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        # Direct Langfuse v3 SDK usage
+        # Langfuse integration
         # Note: session_id is set via propagate_attributes in loop.py, not here
-        langfuse_generation = None
+        langfuse_observation = None
         try:
             if self.langfuse.enabled and self.langfuse._client:
                 metadata = {"has_tools": tools is not None}
-                langfuse_generation = self.langfuse._client.start_generation(
-                    name="llm-chat",
-                    model=model,
-                    input=messages,
-                    metadata=metadata,
-                )
+                client = self.langfuse._client
+                # Use start_observation with generation type
+                if hasattr(client, "start_observation"):
+                    langfuse_observation = client.start_observation(
+                        name="llm-chat",
+                        as_type="generation",
+                        model=model,
+                        input=messages,
+                        metadata=metadata,
+                    )
 
             response = await acompletion(**kwargs)
             llm_response = self._parse_response(response)
 
-            # Update and end Langfuse generation
-            if langfuse_generation:
+            # Update and end Langfuse observation
+            if langfuse_observation:
                 output_text = llm_response.content or ""
                 if llm_response.tool_calls:
                     output_text = (
@@ -180,21 +184,20 @@ class LiteLLMProvider(LLMProvider):
                         or f"[Tool calls: {[tc.name for tc in llm_response.tool_calls]}]"
                     )
 
-                # Update generation with output and usage
+                # Update observation with output and usage
                 update_kwargs: dict[str, Any] = {
                     "output": output_text,
                     "metadata": {"finish_reason": llm_response.finish_reason},
                 }
 
                 if llm_response.usage:
-                    # Langfuse v3 SDK expects "usage_details" with "input" and "output" keys
+                    # Add usage data using usage_details format
                     usage_details: dict[str, Any] = {
                         "input": llm_response.usage.get("prompt_tokens", 0),
                         "output": llm_response.usage.get("completion_tokens", 0),
                     }
 
-                    # Add cache read tokens if available (OpenAI/Anthropic prompt caching)
-                    # Try multiple possible field names for cached tokens
+                    # Add cache read tokens if available
                     cache_read_tokens = llm_response.usage.get(
                         "cache_read_input_tokens"
                     ) or llm_response.usage.get("prompt_tokens_details", {}).get("cached_tokens")
@@ -202,23 +205,44 @@ class LiteLLMProvider(LLMProvider):
                         usage_details["cache_read_input_tokens"] = cache_read_tokens
 
                     update_kwargs["usage_details"] = usage_details
-                    # Log the usage details being sent to Langfuse
-                    # logger.info(f"[LANGFUSE] Updating generation with usage_details: {usage_details}")
 
-                langfuse_generation.update(**update_kwargs)
-                langfuse_generation.end()
-                self.langfuse.flush()
+                # Update the observation
+                if hasattr(langfuse_observation, "update"):
+                    try:
+                        langfuse_observation.update(**update_kwargs)
+                    except Exception as e:
+                        logger.debug(f"[LANGFUSE] Failed to update observation: {e}")
+
+                # End the observation
+                if hasattr(langfuse_observation, "end"):
+                    try:
+                        langfuse_observation.end()
+                    except Exception as e:
+                        logger.debug(f"[LANGFUSE] Failed to end observation: {e}")
+
+                try:
+                    self.langfuse.flush()
+                except Exception as e:
+                    logger.debug(f"[LANGFUSE] Failed to flush: {e}")
 
             return llm_response
         except Exception as e:
-            # End Langfuse generation with error
-            if langfuse_generation:
-                langfuse_generation.update(
-                    output=f"Error: {str(e)}",
-                    metadata={"error": str(e)},
-                )
-                langfuse_generation.end()
-                self.langfuse.flush()
+            # End Langfuse observation with error
+            if langfuse_observation:
+                try:
+                    if hasattr(langfuse_observation, "update"):
+                        langfuse_observation.update(
+                            output=f"Error: {str(e)}",
+                            metadata={"error": str(e)},
+                        )
+                    if hasattr(langfuse_observation, "end"):
+                        langfuse_observation.end()
+                    try:
+                        self.langfuse.flush()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",

@@ -263,6 +263,7 @@ class AsyncHTTPClient(BaseClient):
             for file_path in dir_path.rglob("*"):
                 if file_path.is_file():
                     arcname = file_path.relative_to(dir_path)
+                    arcname = str(arcname).replace("\\", "/")
                     zipf.write(file_path, arcname=arcname)
 
         return str(zip_path)
@@ -294,6 +295,7 @@ class AsyncHTTPClient(BaseClient):
         include: Optional[str] = None,
         exclude: Optional[str] = None,
         directly_upload_media: bool = True,
+        preserve_structure: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking."""
         # Validate that only one of 'to' or 'parent' is set
@@ -313,6 +315,8 @@ class AsyncHTTPClient(BaseClient):
             "exclude": exclude,
             "directly_upload_media": directly_upload_media,
         }
+        if preserve_structure is not None:
+            request_data["preserve_structure"] = preserve_structure
 
         path_obj = Path(path)
         if path_obj.exists() and not self._is_local_server():

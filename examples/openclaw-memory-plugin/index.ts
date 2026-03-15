@@ -28,10 +28,12 @@ import {
   waitForHealth,
   withTimeout,
   quickRecallPrecheck,
-  quickHealthCheck,
-  quickTcpProbe,
   resolvePythonCommand,
+  prepareLocalPort,
 } from "./process-manager.js";
+
+const MAX_OPENVIKING_STDERR_LINES = 200;
+const MAX_OPENVIKING_STDERR_CHARS = 256_000;
 
 const memoryPlugin = {
   id: "memory-openviking",
@@ -352,7 +354,16 @@ const memoryPlugin = {
     );
 
     if (cfg.autoRecall || cfg.ingestReplyAssist) {
-      api.on("before_agent_start", async (event: { messages?: unknown[]; prompt: string }) => {
+      api.on("before_agent_start", async (event: { messages?: unknown[]; prompt: string }, ctx?: { agentId?: string }) => {
+        // Dynamically switch agent identity for multi-agent memory isolation.
+        // In multi-agent gateway deployments, the hook context carries the current
+        // agent's ID so we route memory operations to the correct agent_space.
+        const hookAgentId = ctx?.agentId;
+        if (hookAgentId) {
+          const client = await getClient();
+          client.setAgentId(hookAgentId);
+          api.logger.info?.(`memory-openviking: switched to agentId=${hookAgentId} for recall`);
+        }
         const queryText = extractLatestUserText(event.messages) || event.prompt.trim();
         if (!queryText) {
           return;
@@ -472,7 +483,14 @@ const memoryPlugin = {
     if (cfg.autoCapture) {
       let lastProcessedMsgCount = 0;
 
-      api.on("agent_end", async (event: { success?: boolean; messages?: unknown[] }) => {
+      api.on("agent_end", async (event: { success?: boolean; messages?: unknown[] }, ctx?: { agentId?: string }) => {
+        // Dynamically switch agent identity for multi-agent memory isolation
+        const hookAgentId = ctx?.agentId;
+        if (hookAgentId) {
+          const client = await getClient();
+          client.setAgentId(hookAgentId);
+          api.logger.info?.(`memory-openviking: switched to agentId=${hookAgentId} for capture`);
+        }
         if (!event.success || !event.messages || event.messages.length === 0) {
           api.logger.info(
             `memory-openviking: auto-capture skipped (success=${String(event.success)}, messages=${event.messages?.length ?? 0})`,
@@ -539,34 +557,13 @@ const memoryPlugin = {
       id: "memory-openviking",
       start: async () => {
         if (cfg.mode === "local" && resolveLocalClient) {
-          const baseUrl = cfg.baseUrl;
           const timeoutMs = 60_000;
           const intervalMs = 500;
-          // 1. Check if a healthy OpenViking is already running on this port — reuse it
-          const existingHealthy = await quickHealthCheck(baseUrl, 2000);
-          if (existingHealthy) {
-            const client = new OpenVikingClient(baseUrl, cfg.apiKey, cfg.agentId, cfg.timeoutMs);
-            localClientCache.set(localCacheKey, { client, process: null });
-            resolveLocalClient(client);
-            rejectLocalClient = null;
-            api.logger.info(
-              `memory-openviking: reusing existing server at ${baseUrl}`,
-            );
-            return;
-          }
 
-          // 2. Check if port is occupied by something else
-          const portOccupied = await quickTcpProbe("127.0.0.1", cfg.port, 500);
-          if (portOccupied) {
-            const msg = `memory-openviking: port ${cfg.port} is occupied by another process (not OpenViking). ` +
-              `Change the port in your plugin config or ov.conf, e.g.: ` +
-              `openclaw config set plugins.entries.memory-openviking.config.port 1934`;
-            api.logger.warn(msg);
-            markLocalUnavailable("port occupied", new Error(msg));
-            throw new Error(msg);
-          }
+          // Prepare port: kill stale OpenViking, or auto-find free port if occupied by others
+          const actualPort = await prepareLocalPort(cfg.port, api.logger);
+          const baseUrl = `http://127.0.0.1:${actualPort}`;
 
-          // 3. Port is free — start OpenViking
           const pythonCmd = resolvePythonCommand(api.logger);
 
           // Inherit system environment; optionally override Go/Python paths via env vars
@@ -578,7 +575,7 @@ const memoryPlugin = {
             OPENVIKING_CONFIG_FILE: cfg.configPath,
             OPENVIKING_START_CONFIG: cfg.configPath,
             OPENVIKING_START_HOST: "127.0.0.1",
-            OPENVIKING_START_PORT: String(cfg.port),
+            OPENVIKING_START_PORT: String(actualPort),
             ...(process.env.OPENVIKING_GO_PATH && { PATH: `${process.env.OPENVIKING_GO_PATH}${pathSep}${process.env.PATH || ""}` }),
             ...(process.env.OPENVIKING_GOPATH && { GOPATH: process.env.OPENVIKING_GOPATH }),
             ...(process.env.OPENVIKING_GOPROXY && { GOPROXY: process.env.OPENVIKING_GOPROXY }),
@@ -593,15 +590,43 @@ const memoryPlugin = {
           );
           localProcess = child;
           const stderrChunks: string[] = [];
+          let stderrCharCount = 0;
+          let stderrDroppedChunks = 0;
+          const pushStderrChunk = (chunk: string) => {
+            if (!chunk) return;
+            stderrChunks.push(chunk);
+            stderrCharCount += chunk.length;
+            while (
+              stderrChunks.length > MAX_OPENVIKING_STDERR_LINES ||
+              stderrCharCount > MAX_OPENVIKING_STDERR_CHARS
+            ) {
+              const dropped = stderrChunks.shift();
+              if (!dropped) break;
+              stderrCharCount -= dropped.length;
+              stderrDroppedChunks += 1;
+            }
+          };
+          const formatStderrOutput = () => {
+            if (!stderrChunks.length && !stderrDroppedChunks) return "";
+            const truncated =
+              stderrDroppedChunks > 0
+                ? `[truncated ${stderrDroppedChunks} earlier stderr chunk(s)]\n`
+                : "";
+            return `\n[openviking stderr]\n${truncated}${stderrChunks.join("\n")}`;
+          };
           child.on("error", (err: Error) => api.logger.warn(`memory-openviking: local server error: ${String(err)}`));
           child.stderr?.on("data", (chunk: Buffer) => {
             const s = String(chunk).trim();
-            if (s) stderrChunks.push(s);
+            pushStderrChunk(s);
             api.logger.debug?.(`[openviking] ${s}`);
           });
           child.on("exit", (code: number | null, signal: string | null) => {
-            if (localProcess === child && (code != null && code !== 0 || signal)) {
-              const out = stderrChunks.length ? `\n[openviking stderr]\n${stderrChunks.join("\n")}` : "";
+            if (localProcess === child) {
+              localProcess = null;
+              localClientCache.delete(localCacheKey);
+            }
+            if (code != null && code !== 0 || signal) {
+              const out = formatStderrOutput();
               api.logger.warn(`memory-openviking: subprocess exited (code=${code}, signal=${signal})${out}`);
             }
           });
@@ -620,7 +645,7 @@ const memoryPlugin = {
             markLocalUnavailable("startup failed", err);
             if (stderrChunks.length) {
               api.logger.warn(
-                `memory-openviking: startup failed (health check timeout or error). OpenViking stderr:\n${stderrChunks.join("\n")}`,
+                `memory-openviking: startup failed (health check timeout or error).${formatStderrOutput()}`,
               );
             }
             throw err;
