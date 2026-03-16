@@ -41,7 +41,7 @@ class Summarizer:
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
 
         temp_uris = kwargs.get("temp_uris", [])
-        if temp_uris == []:
+        if not temp_uris:
             temp_uris = resource_uris
         if len(temp_uris) != len(resource_uris):
             logger.error(

@@ -108,15 +108,7 @@ class SemanticDagExecutor:
 
             async def sync_diff_callback() -> None:
                 try:
-                    root_tree = await self._processor._collect_tree_info(
-                        self._root_uri, ctx=self._ctx
-                    )
-                    target_tree = await self._processor._collect_tree_info(
-                        self._target_uri, ctx=self._ctx
-                    )
-                    diff = await self._processor._compute_diff(
-                        root_tree,
-                        target_tree,
+                    diff = await self._processor._sync_topdown_recursive(
                         self._root_uri,
                         self._target_uri,
                         ctx=self._ctx,
@@ -130,15 +122,6 @@ class SemanticDagExecutor:
                         f"added_dirs={len(diff.added_dirs)}, "
                         f"deleted_dirs={len(diff.deleted_dirs)}"
                     )
-                    await self._processor._execute_sync_operations(
-                        diff, self._root_uri, self._target_uri, ctx=self._ctx
-                    )
-                    try:
-                        await self._viking_fs.rm(self._root_uri, recursive=True, ctx=self._ctx)
-                    except Exception as e:
-                        logger.warning(
-                            f"[SyncDiff] Failed to delete root directory {self._root_uri}: {e}"
-                        )
                 except Exception as e:
                     logger.error(
                         f"[SyncDiff] Error in sync_diff_callback: "

@@ -848,10 +848,16 @@ class VikingVectorIndexBackend:
             return uri
 
         success = False
+        ids_to_delete: List[str] = []
         for record in records:
             if "id" not in record:
                 continue
-            level = record.get("level", 2)
+            raw_level = record.get("level", 2)
+            try:
+                level = int(raw_level)
+            except (TypeError, ValueError):
+                level = 2
+
             seed_uri = _seed_uri_for_id(new_uri, level)
             id_seed = f"{ctx.account_id}:{seed_uri}"
             new_id = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
@@ -864,6 +870,12 @@ class VikingVectorIndexBackend:
             }
             if await self.upsert(updated, ctx=ctx):
                 success = True
+                old_id = record.get("id")
+                if old_id and old_id != new_id:
+                    ids_to_delete.append(old_id)
+
+        if ids_to_delete:
+            await self.delete(list(set(ids_to_delete)), ctx=ctx)
 
         return success
 

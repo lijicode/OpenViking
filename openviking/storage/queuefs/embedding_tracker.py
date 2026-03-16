@@ -3,7 +3,6 @@
 """Embedding Task Tracker for tracking embedding task completion status."""
 
 import asyncio
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from openviking_cli.utils.logger import get_logger
@@ -11,7 +10,6 @@ from openviking_cli.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass
 class EmbeddingTaskTracker:
     """Track embedding task completion status for each SemanticMsg.
 
@@ -21,12 +19,19 @@ class EmbeddingTaskTracker:
     """
 
     _instance: Optional["EmbeddingTaskTracker"] = None
-    _lock: Optional[asyncio.Lock] = None
-    _tasks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _initialized: bool = False
 
-    def __post_init__(self):
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def __new__(cls) -> "EmbeddingTaskTracker":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._initialized = True
 
     @classmethod
     def get_instance(cls) -> "EmbeddingTaskTracker":

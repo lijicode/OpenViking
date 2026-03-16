@@ -374,37 +374,24 @@ class SemanticProcessor(DequeueHandlerBase):
         )
         logger.info(f"Vectorized abstract.md and overview.md for {dir_uri}")
 
-    async def _collect_tree_info(
+    async def _sync_topdown_recursive(
         self,
-        uri: str,
+        root_uri: str,
+        target_uri: str,
         ctx: Optional[RequestContext] = None,
-    ) -> Dict[str, Tuple[List[str], List[str]]]:
-        """
-        Recursively collect directory tree information.
-
-        Args:
-            uri: Directory URI
-            ctx: Request context
-
-        Returns:
-            Dictionary: {dir_uri: ([subdir_uris], [file_uris])}
-        """
+        file_change_status: Optional[Dict[str, bool]] = None,
+    ) -> DiffResult:
         viking_fs = get_viking_fs()
-        result: Dict[str, Tuple[List[str], List[str]]] = {}
-        total_dirs = 0
-        total_files = 0
+        diff = DiffResult()
 
-        async def collect_recursive(current_uri: str, depth: int = 0) -> None:
-            nonlocal total_dirs, total_files
-            indent = "  " * depth
+        async def list_children(dir_uri: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+            files: Dict[str, str] = {}
+            dirs: Dict[str, str] = {}
             try:
-                entries = await viking_fs.ls(current_uri, show_all_hidden=True, ctx=ctx)
+                entries = await viking_fs.ls(dir_uri, show_all_hidden=True, ctx=ctx)
             except Exception as e:
-                logger.warning(f"[SyncDiff]{indent} Failed to list {current_uri}: {e}")
-                return
-
-            sub_dirs: List[str] = []
-            files: List[str] = []
+                logger.warning(f"[SyncDiff] Failed to list {dir_uri}: {e}")
+                return files, dirs
 
             for entry in entries:
                 name = entry.get("name", "")
@@ -412,215 +399,151 @@ class SemanticProcessor(DequeueHandlerBase):
                     continue
                 if name.startswith(".") and name not in [".abstract.md", ".overview.md"]:
                     continue
-
-                item_uri = VikingURI(current_uri).join(name).uri
-
+                item_uri = VikingURI(dir_uri).join(name).uri
                 if entry.get("isDir", False):
-                    sub_dirs.append(item_uri)
-                    total_dirs += 1
-                    await collect_recursive(item_uri, depth + 1)
+                    dirs[name] = item_uri
                 else:
-                    files.append(item_uri)
-                    total_files += 1
+                    files[name] = item_uri
+            return files, dirs
 
-            result[current_uri] = (sub_dirs, files)
+        async def sync_dir(root_dir: str, target_dir: str) -> None:
+            root_files, root_dirs = await list_children(root_dir)
+            target_files, target_dirs = await list_children(target_dir)
 
-        await collect_recursive(uri)
-        return result
+            file_names = set(root_files.keys()) | set(target_files.keys())
+            for name in sorted(file_names):
+                root_file = root_files.get(name)
+                target_file = target_files.get(name)
 
-    async def _compute_diff(
-        self,
-        root_tree: Dict[str, Tuple[List[str], List[str]]],
-        target_tree: Dict[str, Tuple[List[str], List[str]]],
-        root_uri: str,
-        target_uri: str,
-        ctx: Optional[RequestContext] = None,
-        file_change_status: Optional[Dict[str, bool]] = None,
-    ) -> DiffResult:
-        """
-        Compute differences between two directory trees.
-
-        Args:
-            root_tree: Directory tree from root_uri
-            target_tree: Directory tree from target_uri
-            root_uri: Source directory URI
-            target_uri: Target directory URI
-            ctx: Request context
-            file_change_status: Pre-computed file change status mapping.
-                Keys are file URIs, values are True if file has changed.
-
-        Returns:
-            DiffResult with added/deleted/updated files and directories
-        """
-
-        def get_relative_path(uri: str, base_uri: str) -> str:
-            if uri.startswith(base_uri):
-                rel = uri[len(base_uri) :]
-                return rel.lstrip("/")
-            return uri
-
-        root_files: Set[str] = set()
-        root_dirs: Set[str] = set()
-        target_files: Set[str] = set()
-        target_dirs: Set[str] = set()
-
-        for dir_uri, (sub_dirs, files) in root_tree.items():
-            rel_dir = get_relative_path(dir_uri, root_uri)
-            if rel_dir:
-                root_dirs.add(rel_dir)
-            for f in files:
-                root_files.add(get_relative_path(f, root_uri))
-            for d in sub_dirs:
-                root_dirs.add(get_relative_path(d, root_uri))
-
-        for dir_uri, (sub_dirs, files) in target_tree.items():
-            rel_dir = get_relative_path(dir_uri, target_uri)
-            if rel_dir:
-                target_dirs.add(rel_dir)
-            for f in files:
-                target_files.add(get_relative_path(f, target_uri))
-            for d in sub_dirs:
-                target_dirs.add(get_relative_path(d, target_uri))
-
-        added_files_rel = root_files - target_files
-        deleted_files_rel = target_files - root_files
-        common_files = root_files & target_files
-
-        added_dirs_rel = root_dirs - target_dirs
-        deleted_dirs_rel = target_dirs - root_dirs
-
-        updated_files: List[str] = []
-        for rel_file in common_files:
-            root_file = f"{root_uri}/{rel_file}"
-            if file_change_status and root_file in file_change_status:
-                if file_change_status[root_file]:
-                    updated_files.append(root_file)
-            else:
-                target_file = f"{target_uri}/{rel_file}"
-                try:
-                    if await self._check_file_content_changed(root_file, target_file, ctx=ctx):
-                        updated_files.append(root_file)
-                except Exception as e:
-                    logger.warning(
-                        f"[SyncDiff] Failed to compare file content for {rel_file}: {e}, "
-                        f"treating as unchanged"
-                    )
-
-        added_files = [f"{root_uri}/{f}" for f in added_files_rel]
-        deleted_files = [f"{target_uri}/{f}" for f in deleted_files_rel]
-        added_dirs = [f"{root_uri}/{d}" for d in added_dirs_rel]
-        deleted_dirs = [f"{target_uri}/{d}" for d in deleted_dirs_rel]
-
-        result = DiffResult(
-            added_files=added_files,
-            deleted_files=deleted_files,
-            updated_files=updated_files,
-            added_dirs=added_dirs,
-            deleted_dirs=deleted_dirs,
-        )
-
-        return result
-
-    async def _execute_sync_operations(
-        self,
-        diff: DiffResult,
-        root_uri: str,
-        target_uri: str,
-        ctx: Optional[RequestContext] = None,
-    ) -> None:
-        """
-        Execute sync operations based on diff result.
-
-        Processing order:
-        1. Delete files in target that don't exist in root
-        2. Move added/updated files from root to target
-        3. Move added directories' vector data (.abstract.md, .overview.md) from root to target
-        4. Delete directories in target that don't exist in root
-
-        Args:
-            diff: DiffResult containing operations to perform
-            root_uri: Source directory URI
-            target_uri: Target directory URI
-            ctx: Request context
-        """
-        viking_fs = get_viking_fs()
-
-        def map_to_target(root_item_uri: str) -> str:
-            if root_item_uri.startswith(root_uri):
-                rel = root_item_uri[len(root_uri) :]
-                return f"{target_uri}{rel}" if rel else target_uri
-            return root_item_uri
-
-        total_deleted = 0
-        total_moved = 0
-        total_failed = 0
-
-        for i, deleted_file in enumerate(diff.deleted_files, 1):
-            try:
-                await viking_fs.rm(deleted_file, ctx=ctx)
-                total_deleted += 1
-            except Exception as e:
-                total_failed += 1
-                logger.warning(
-                    f"[SyncDiff] Failed to delete file [{i}/{len(diff.deleted_files)}]: {deleted_file}, error={e}"
-                )
-
-        for i, updated_file in enumerate(diff.updated_files, 1):
-            target_file = map_to_target(updated_file)
-            try:
-                await viking_fs.rm(target_file, ctx=ctx)
-            except Exception as e:
-                logger.warning(
-                    f"[SyncDiff] Failed to remove old file [{i}/{len(diff.updated_files)}]: {target_file}, error={e}"
-                )
-
-        files_to_move = diff.added_files + diff.updated_files
-        for i, root_file in enumerate(files_to_move, 1):
-            target_file = map_to_target(root_file)
-            try:
-                target_parent = VikingURI(target_file).parent
-                if target_parent:
+                if root_file and name in target_dirs:
+                    target_conflict_dir = target_dirs[name]
                     try:
-                        await viking_fs.mkdir(target_parent.uri, exist_ok=True, ctx=ctx)
-                    except Exception as mkdir_error:
-                        logger.debug(
-                            f"[SyncDiff] Parent dir creation skipped (may already exist): {mkdir_error}"
+                        await viking_fs.rm(target_conflict_dir, recursive=True, ctx=ctx)
+                        diff.deleted_dirs.append(target_conflict_dir)
+                        target_dirs.pop(name, None)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to delete directory for file conflict: {target_conflict_dir}, error={e}"
                         )
-                await viking_fs.mv(root_file, target_file, ctx=ctx)
-                total_moved += 1
-            except Exception as e:
-                total_failed += 1
-                logger.warning(
-                    f"[SyncDiff] Failed to move file [{i}/{len(files_to_move)}]: "
-                    f"{root_file} -> {target_file}, error={e}"
-                )
+                    target_file = None
 
-        for i, added_dir in enumerate(sorted(diff.added_dirs, key=lambda x: x.count("/")), 1):
-            target_dir = map_to_target(added_dir)
-            try:
-                if await viking_fs.exists(target_dir, ctx=ctx):
-                    await viking_fs.rm(target_dir, recursive=True, ctx=ctx)
-                    logger.debug(f"[SyncDiff] Removed existing target before move: {target_dir}")
-                await viking_fs.mv(added_dir, target_dir, ctx=ctx)
-                logger.debug(f"[SyncDiff] Moved directory: {added_dir} -> {target_dir}")
-            except Exception as e:
-                total_failed += 1
-                logger.warning(
-                    f"[SyncDiff] Failed to move directory [{i}/{len(diff.added_dirs)}]: "
-                    f"{added_dir} -> {target_dir}, error={e}"
-                )
+                if target_file and name in root_dirs and not root_file:
+                    try:
+                        await viking_fs.rm(target_file, ctx=ctx)
+                        diff.deleted_files.append(target_file)
+                        target_files.pop(name, None)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to delete file for dir conflict: {target_file}, error={e}"
+                        )
+                    continue
 
-        for i, deleted_dir in enumerate(
-            sorted(diff.deleted_dirs, key=lambda x: x.count("/"), reverse=True), 1
-        ):
-            try:
-                await viking_fs.rm(deleted_dir, recursive=True, ctx=ctx)
-            except Exception as e:
-                total_failed += 1
-                logger.warning(
-                    f"[SyncDiff] Failed to delete directory [{i}/{len(diff.deleted_dirs)}]: "
-                    f"{deleted_dir}, error={e}"
-                )
+                if target_file and not root_file:
+                    try:
+                        await viking_fs.rm(target_file, ctx=ctx)
+                        diff.deleted_files.append(target_file)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to delete file: {target_file}, error={e}"
+                        )
+                    continue
+
+                if root_file and target_file:
+                    changed = False
+                    if file_change_status and root_file in file_change_status:
+                        changed = file_change_status[root_file]
+                    else:
+                        try:
+                            changed = await self._check_file_content_changed(
+                                root_file, target_file, ctx=ctx
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[SyncDiff] Failed to compare file content for {root_file}: {e}, treating as unchanged"
+                            )
+                            changed = False
+                    if changed:
+                        diff.updated_files.append(root_file)
+                        try:
+                            await viking_fs.rm(target_file, ctx=ctx)
+                        except Exception as e:
+                            logger.warning(
+                                f"[SyncDiff] Failed to remove old file before update: {target_file}, error={e}"
+                            )
+                        try:
+                            await viking_fs.mv(root_file, target_file, ctx=ctx)
+                        except Exception as e:
+                            logger.warning(
+                                f"[SyncDiff] Failed to move updated file: {root_file} -> {target_file}, error={e}"
+                            )
+                    continue
+
+                if root_file and not target_file:
+                    diff.added_files.append(root_file)
+                    target_file_uri = VikingURI(target_dir).join(name).uri
+                    try:
+                        await viking_fs.mv(root_file, target_file_uri, ctx=ctx)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to move added file: {root_file} -> {target_file_uri}, error={e}"
+                        )
+
+            dir_names = set(root_dirs.keys()) | set(target_dirs.keys())
+            for name in sorted(dir_names):
+                root_subdir = root_dirs.get(name)
+                target_subdir = target_dirs.get(name)
+
+                if root_subdir and name in target_files:
+                    target_conflict_file = target_files[name]
+                    try:
+                        await viking_fs.rm(target_conflict_file, ctx=ctx)
+                        diff.deleted_files.append(target_conflict_file)
+                        target_files.pop(name, None)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to delete file for dir conflict: {target_conflict_file}, error={e}"
+                        )
+                    target_subdir = None
+
+                if target_subdir and not root_subdir:
+                    try:
+                        await viking_fs.rm(target_subdir, recursive=True, ctx=ctx)
+                        diff.deleted_dirs.append(target_subdir)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to delete directory: {target_subdir}, error={e}"
+                        )
+                    continue
+
+                if root_subdir and not target_subdir:
+                    diff.added_dirs.append(root_subdir)
+                    target_subdir_uri = VikingURI(target_dir).join(name).uri
+                    try:
+                        await viking_fs.mv(root_subdir, target_subdir_uri, ctx=ctx)
+                    except Exception as e:
+                        logger.warning(
+                            f"[SyncDiff] Failed to move added directory: {root_subdir} -> {target_subdir_uri}, error={e}"
+                        )
+                    continue
+
+                if root_subdir and target_subdir:
+                    await sync_dir(root_subdir, target_subdir)
+
+        target_exists = await viking_fs.exists(target_uri, ctx=ctx)
+        if not target_exists:
+            parent_uri = VikingURI(target_uri).parent
+            if parent_uri:
+                await viking_fs.mkdir(parent_uri.uri, exist_ok=True, ctx=ctx)
+            diff.added_dirs.append(root_uri)
+            await viking_fs.mv(root_uri, target_uri, ctx=ctx)
+            return diff
+
+        await sync_dir(root_uri, target_uri)
+        try:
+            await viking_fs.rm(root_uri, recursive=True, ctx=ctx)
+        except Exception as e:
+            logger.warning(f"[SyncDiff] Failed to delete root directory {root_uri}: {e}")
+        return diff
 
     async def _collect_children_abstracts(
         self, children_uris: List[str], ctx: Optional[RequestContext] = None
@@ -786,28 +709,26 @@ class SemanticProcessor(DequeueHandlerBase):
         current_summary_lines: List[str] = []
 
         for line in lines:
-            header_match = re.match(r"^#{1,3}\s+(.+?\.md)\s*$", line)
+            header_match = re.match(r"^###\s+(.+?)\s*$", line)
             if header_match:
                 if current_file and current_summary_lines:
                     summaries[current_file] = " ".join(current_summary_lines).strip()
-                current_file = header_match.group(1).strip()
+
+                file_name = header_match.group(1).strip()
+                parts = file_name.split()
+                if len(parts) >= 2 and parts[0] == parts[1]:
+                    file_name = parts[0]
+
+                current_file = file_name
                 current_summary_lines = []
                 continue
 
-            bullet_match = re.match(r"^[-*]\s+\*{0,2}(.+?\.md)\*{0,2}:\s*(.+)$", line)
-            if bullet_match:
-                if current_file and current_summary_lines:
-                    summaries[current_file] = " ".join(current_summary_lines).strip()
-                current_file = bullet_match.group(1).strip()
-                current_summary_lines = [bullet_match.group(2).strip()]
-                continue
-
-            numbered_match = re.match(r"^(?:\d+\.|\[\d+\])\s+(.+?\.md):\s*(.+)$", line)
+            numbered_match = re.match(r"^\[(\d+)\]\s+(.+?):\s*(.+)$", line)
             if numbered_match:
                 if current_file and current_summary_lines:
                     summaries[current_file] = " ".join(current_summary_lines).strip()
-                current_file = numbered_match.group(1).strip()
-                current_summary_lines = [numbered_match.group(2).strip()]
+                current_file = numbered_match.group(2).strip()
+                current_summary_lines = [numbered_match.group(3).strip()]
                 continue
 
             if current_file:
