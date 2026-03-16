@@ -149,6 +149,7 @@ class OpenVikingService:
             max_parallel_locks=tx_cfg.max_parallel_locks,
             lock_timeout=tx_cfg.lock_timeout,
             lock_expire=tx_cfg.lock_expire,
+            vector_store=self._vikingdb_manager,
         )
 
     @property

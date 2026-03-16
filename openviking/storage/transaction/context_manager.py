@@ -145,7 +145,7 @@ class TransactionContext:
         self.record.post_actions.append({"type": action_type, "params": params})
 
     async def commit(self) -> None:
-        self._committed = True
         success = await self._tx_manager.commit(self._record.id)
         if not success:
             raise TransactionError(f"Failed to commit transaction {self._record.id}")
+        self._committed = True

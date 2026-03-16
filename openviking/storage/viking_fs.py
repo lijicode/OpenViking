@@ -1172,19 +1172,6 @@ class VikingFS:
                 return str(result)
             except Exception:
                 return ""
-        """Handle AGFSClient content return types consistently."""
-        if isinstance(result, bytes):
-            return result.decode("utf-8")
-        elif hasattr(result, "content"):
-            return result.content.decode("utf-8")
-        elif result is None:
-            return ""
-        else:
-            # Try to convert to string
-            try:
-                return str(result)
-            except Exception:
-                return ""
 
     def _infer_context_type(self, uri: str):
         """Infer context_type from URI. Returns None when ambiguous."""

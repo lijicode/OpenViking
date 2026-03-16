@@ -335,6 +335,8 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_path = viking_fs._uri_to_path(uri, ctx=self._current_ctx)
 
         try:
+            # No undo entries recorded: semantic files (.overview.md / .abstract.md) are
+            # regenerable, so residual writes after a crash are acceptable.
             async with TransactionContext(
                 get_transaction_manager(), "semantic", [dir_path], lock_mode="point"
             ) as tx:

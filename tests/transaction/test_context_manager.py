@@ -87,7 +87,9 @@ class TestTransactionContextLockModes:
         ) as tx:
             await tx.commit()
 
-        tx_manager.acquire_lock_mv.assert_called_once_with("tx-test", "/src", "/dst")
+        tx_manager.acquire_lock_mv.assert_called_once_with(
+            "tx-test", "/src", "/dst", src_is_dir=True
+        )
 
     async def test_point_lock_mode(self):
         tx_manager, record = _make_tx_manager()

@@ -279,6 +279,8 @@ class SemanticDagExecutor:
         abstract = ""
         try:
             dir_path = self._viking_fs._uri_to_path(dir_uri, ctx=self._ctx)
+            # No undo entries recorded: semantic files (.overview.md / .abstract.md) are
+            # regenerable, so residual writes after a crash are acceptable.
             async with TransactionContext(
                 get_transaction_manager(), "semantic_dag", [dir_path], lock_mode="point"
             ) as tx:

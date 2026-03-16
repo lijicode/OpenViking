@@ -205,9 +205,10 @@ async def import_ovpack(
             if not zip_path:
                 continue
 
-            # Normalize path separators to handle Windows-created ZIPs
-            zip_path = zip_path.replace("\\", "/")
+            # Validate before normalization so backslash paths are rejected
             safe_zip_path = _validate_ovpack_member_path(zip_path, base_name)
+            # Normalize path separators to handle Windows-created ZIPs
+            safe_zip_path = safe_zip_path.replace("\\", "/")
 
             # Handle directory entries
             if safe_zip_path.endswith("/"):

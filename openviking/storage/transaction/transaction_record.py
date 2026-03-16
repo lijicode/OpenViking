@@ -16,11 +16,11 @@ from typing import Any, Dict, List
 class TransactionStatus(str, Enum):
     """Transaction status enumeration.
 
-    Status machine: INIT -> AQUIRE -> EXEC -> COMMIT/FAIL -> RELEASING -> RELEASED
+    Status machine: INIT -> ACQUIRE -> EXEC -> COMMIT/FAIL -> RELEASING -> RELEASED
     """
 
     INIT = "INIT"  # Transaction initialized, waiting for lock acquisition
-    AQUIRE = "AQUIRE"  # Acquiring lock resources
+    ACQUIRE = "ACQUIRE"  # Acquiring lock resources
     EXEC = "EXEC"  # Transaction operation in progress
     COMMIT = "COMMIT"  # Transaction completed successfully
     FAIL = "FAIL"  # Transaction failed

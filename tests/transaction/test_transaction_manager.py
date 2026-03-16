@@ -67,7 +67,7 @@ class TestBegin:
         tx = manager.create_transaction()
         ok = await manager.begin(tx.id)
         assert ok is True
-        assert tx.status == TransactionStatus.AQUIRE
+        assert tx.status == TransactionStatus.ACQUIRE
 
     async def test_begin_unknown_tx(self):
         manager, _ = _make_manager()

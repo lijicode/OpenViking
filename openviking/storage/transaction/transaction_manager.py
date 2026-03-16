@@ -44,6 +44,7 @@ class TransactionManager:
         max_parallel_locks: int = 8,
         lock_timeout: float = 0.0,
         lock_expire: float = 300.0,
+        vector_store: Optional[Any] = None,
     ):
         """Initialize transaction manager.
 
@@ -55,6 +56,7 @@ class TransactionManager:
                 0 (default) = fail immediately if locked.
                 > 0 = wait/retry up to this many seconds.
             lock_expire: Stale lock expiry threshold in seconds (default: 300s).
+            vector_store: Optional vector store for VectorDB rollback operations.
         """
         from openviking.storage.transaction.journal import TransactionJournal
 
@@ -62,6 +64,7 @@ class TransactionManager:
         self._timeout = timeout
         self._max_parallel_locks = max_parallel_locks
         self._lock_timeout = lock_timeout
+        self._vector_store = vector_store
         self._path_lock = PathLock(agfs_client, lock_expire=lock_expire)
         self._journal = TransactionJournal(agfs_client)
 
@@ -205,7 +208,7 @@ class TransactionManager:
                     await self._execute_post_actions(tx.post_actions)
                 except Exception as e:
                     logger.warning(f"Post-action replay failed for tx {tx_id}: {e}")
-        elif tx.status in (TransactionStatus.INIT, TransactionStatus.AQUIRE):
+        elif tx.status in (TransactionStatus.INIT, TransactionStatus.ACQUIRE):
             # Transaction never executed any operations — nothing to rollback.
             # However, locks may have been created before the journal was updated
             # with the actual locks list. Use init_info.lock_paths to find and
@@ -218,7 +221,12 @@ class TransactionManager:
             # Pass recover_all=True so partial (completed=False) ops are also reversed,
             # e.g. a directory mv that started but never finished still leaves residue.
             try:
-                execute_rollback(tx.undo_log, self._agfs, recover_all=True)
+                execute_rollback(
+                    tx.undo_log,
+                    self._agfs,
+                    vector_store=self._vector_store,
+                    recover_all=True,
+                )
             except Exception as e:
                 logger.warning(f"Rollback during recovery failed for tx {tx_id}: {e}")
 
@@ -306,7 +314,7 @@ class TransactionManager:
             logger.error(f"Transaction not found: {transaction_id}")
             return False
 
-        tx.update_status(TransactionStatus.AQUIRE)
+        tx.update_status(TransactionStatus.ACQUIRE)
         logger.debug(f"Transaction begun: {transaction_id}")
         return True
 
@@ -389,7 +397,11 @@ class TransactionManager:
         # Execute undo log (best-effort)
         if tx.undo_log:
             try:
-                execute_rollback(tx.undo_log, self._agfs)
+                execute_rollback(
+                    tx.undo_log,
+                    self._agfs,
+                    vector_store=self._vector_store,
+                )
             except Exception as e:
                 logger.warning(
                     f"Undo log execution failed during rollback of {transaction_id}: {e}"
@@ -447,10 +459,20 @@ class TransactionManager:
         uri = params.get("uri")
         context_type = params.get("context_type", "resource")
         account_id = params.get("account_id", "default")
+        user_id = params.get("user_id", "default")
+        agent_id = params.get("agent_id", "default")
+        role = params.get("role", "root")
         if not uri:
             return
 
-        msg = SemanticMsg(uri=uri, context_type=context_type, account_id=account_id)
+        msg = SemanticMsg(
+            uri=uri,
+            context_type=context_type,
+            account_id=account_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            role=role,
+        )
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC)
         await semantic_queue.enqueue(msg)
 
@@ -469,7 +491,7 @@ class TransactionManager:
             logger.error(f"Transaction not found: {transaction_id}")
             return False
 
-        tx.update_status(TransactionStatus.AQUIRE)
+        tx.update_status(TransactionStatus.ACQUIRE)
         success = await self._path_lock.acquire_point(path, tx, timeout=self._lock_timeout)
 
         if success:
@@ -497,7 +519,7 @@ class TransactionManager:
             logger.error(f"Transaction not found: {transaction_id}")
             return False
 
-        tx.update_status(TransactionStatus.AQUIRE)
+        tx.update_status(TransactionStatus.ACQUIRE)
         effective_timeout = timeout if timeout is not None else self._lock_timeout
         success = await self._path_lock.acquire_subtree(path, tx, timeout=effective_timeout)
 
@@ -533,7 +555,7 @@ class TransactionManager:
             logger.error(f"Transaction not found: {transaction_id}")
             return False
 
-        tx.update_status(TransactionStatus.AQUIRE)
+        tx.update_status(TransactionStatus.ACQUIRE)
         effective_timeout = timeout if timeout is not None else self._lock_timeout
         success = await self._path_lock.acquire_mv(
             src_path, dst_path, tx, timeout=effective_timeout, src_is_dir=src_is_dir
@@ -569,6 +591,7 @@ def init_transaction_manager(
     max_parallel_locks: int = 8,
     lock_timeout: float = 0.0,
     lock_expire: float = 300.0,
+    vector_store: Optional[Any] = None,
 ) -> TransactionManager:
     """Initialize transaction manager singleton.
 
@@ -580,6 +603,7 @@ def init_transaction_manager(
             0 (default) = fail immediately if locked.
             > 0 = wait/retry up to this many seconds.
         lock_expire: Stale lock expiry threshold in seconds (default: 300s).
+        vector_store: Optional vector store for VectorDB rollback operations.
 
     Returns:
         TransactionManager instance
@@ -598,6 +622,7 @@ def init_transaction_manager(
             max_parallel_locks=max_parallel_locks,
             lock_timeout=lock_timeout,
             lock_expire=lock_expire,
+            vector_store=vector_store,
         )
 
         logger.info("TransactionManager initialized as singleton")

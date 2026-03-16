@@ -128,7 +128,7 @@ class TestE2ERollback:
 
 class TestE2EMvLock:
     async def test_mv_lock_acquires_both_paths(self, agfs_client, tx_manager, test_dir):
-        """mv lock mode acquires SUBTREE on source and POINT on destination."""
+        """mv lock mode acquires SUBTREE on both source and destination."""
         src = f"{test_dir}/mv-src-{uuid.uuid4().hex}"
         dst = f"{test_dir}/mv-dst-{uuid.uuid4().hex}"
         agfs_client.mkdir(src)
@@ -144,7 +144,7 @@ class TestE2EMvLock:
             dst_token_str = dst_token.decode("utf-8") if isinstance(dst_token, bytes) else dst_token
 
             assert ":S" in src_token_str  # SUBTREE on source
-            assert ":P" in dst_token_str  # POINT on destination
+            assert ":S" in dst_token_str  # SUBTREE on destination
 
             await tx.commit()
 

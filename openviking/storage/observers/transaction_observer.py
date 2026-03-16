@@ -81,7 +81,7 @@ class TransactionObserver(BaseObserver):
         # Group transactions by status
         status_counts = {
             TransactionStatus.INIT: 0,
-            TransactionStatus.AQUIRE: 0,
+            TransactionStatus.ACQUIRE: 0,
             TransactionStatus.EXEC: 0,
             TransactionStatus.COMMIT: 0,
             TransactionStatus.FAIL: 0,
@@ -107,7 +107,7 @@ class TransactionObserver(BaseObserver):
 
         status_priority = {
             TransactionStatus.EXEC: 0,
-            TransactionStatus.AQUIRE: 1,
+            TransactionStatus.ACQUIRE: 1,
             TransactionStatus.RELEASING: 2,
             TransactionStatus.INIT: 3,
             TransactionStatus.COMMIT: 4,
@@ -206,7 +206,7 @@ class TransactionObserver(BaseObserver):
 
         summary = {
             "INIT": 0,
-            "AQUIRE": 0,
+            "ACQUIRE": 0,
             "EXEC": 0,
             "COMMIT": 0,
             "FAIL": 0,

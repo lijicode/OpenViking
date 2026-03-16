@@ -272,6 +272,29 @@ class PathLock:
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
 
+            # Check ancestor paths for SUBTREE locks held by other transactions
+            ancestor_conflict = await self._check_ancestors_for_subtree(path, transaction_id)
+            if ancestor_conflict:
+                if self.is_lock_stale(ancestor_conflict, self._lock_expire):
+                    logger.warning(
+                        f"[SUBTREE] Removing stale ancestor SUBTREE lock: {ancestor_conflict}"
+                    )
+                    await self._remove_lock_file(ancestor_conflict)
+                    if asyncio.get_event_loop().time() >= deadline:
+                        logger.warning(
+                            f"[SUBTREE] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
+                        )
+                        return False
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    continue
+                if asyncio.get_event_loop().time() >= deadline:
+                    logger.warning(
+                        f"[SUBTREE] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
+                    )
+                    return False
+                await asyncio.sleep(_POLL_INTERVAL)
+                continue
+
             desc_conflict = await self._scan_descendants_for_locks(path, transaction_id)
             if desc_conflict:
                 if self.is_lock_stale(desc_conflict, self._lock_expire):
@@ -360,8 +383,9 @@ class PathLock:
         return True
 
     async def release(self, transaction: TransactionRecord) -> None:
+        lock_count = len(transaction.locks)
         for lock_path in reversed(transaction.locks):
             await self._remove_lock_file(lock_path)
             transaction.remove_lock(lock_path)
 
-        logger.debug(f"Released {len(transaction.locks)} locks for transaction {transaction.id}")
+        logger.debug(f"Released {lock_count} locks for transaction {transaction.id}")

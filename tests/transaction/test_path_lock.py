@@ -181,8 +181,8 @@ class TestPathLockBehavior:
 
         await lock.release(tx_child)
 
-    async def test_acquire_mv_creates_subtree_and_point(self, agfs_client, test_dir):
-        """acquire_mv puts SUBTREE on src and POINT on dst."""
+    async def test_acquire_mv_creates_subtree_locks(self, agfs_client, test_dir):
+        """acquire_mv puts SUBTREE on both src and dst."""
         import uuid as _uuid
 
         src = f"{test_dir}/src-{_uuid.uuid4().hex}"
@@ -209,7 +209,7 @@ class TestPathLockBehavior:
             if isinstance(dst_token_bytes, bytes)
             else dst_token_bytes
         )
-        assert ":P" in dst_token
+        assert ":S" in dst_token
 
         await lock.release(tx)
 

@@ -251,7 +251,7 @@ Contains: transaction ID, status, lock paths, init_info, undo_log, post_actions.
 
 ```
 Create transaction -> write journal (INIT)
-Acquire lock       -> update journal (AQUIRE -> EXEC)
+Acquire lock       -> update journal (ACQUIRE -> EXEC)
 Execute changes    -> update journal per step (mark undo entry completed)
 Commit             -> update journal (COMMIT + post_actions)
                    -> execute post_actions -> release locks -> delete journal
@@ -267,7 +267,7 @@ Rollback           -> execute undo log -> release locks -> delete journal
 | `COMMIT` + non-empty post_actions | Replay post_actions -> release locks -> delete journal |
 | `COMMIT` + empty post_actions / `RELEASED` | Release locks -> delete journal |
 | `EXEC` / `FAIL` / `RELEASING` | Execute undo log rollback (`recover_all=True`) -> release locks -> delete journal |
-| `INIT` / `AQUIRE` | Clean up orphan locks (using init_info.lock_paths) -> delete journal (no changes were made) |
+| `INIT` / `ACQUIRE` | Clean up orphan locks (using init_info.lock_paths) -> delete journal (no changes were made) |
 
 ### Defense Summary
 
@@ -283,13 +283,13 @@ Rollback           -> execute undo log -> release locks -> delete journal
 ## Transaction State Machine
 
 ```
-INIT -> AQUIRE -> EXEC -> COMMIT -> RELEASING -> RELEASED
+INIT -> ACQUIRE -> EXEC -> COMMIT -> RELEASING -> RELEASED
                     |
                    FAIL -> RELEASING -> RELEASED
 ```
 
 - `INIT`: Transaction created, waiting for lock
-- `AQUIRE`: Acquiring lock
+- `ACQUIRE`: Acquiring lock
 - `EXEC`: Transaction operations executing
 - `COMMIT`: Committed, post_actions may be pending
 - `FAIL`: Execution failed, entering rollback

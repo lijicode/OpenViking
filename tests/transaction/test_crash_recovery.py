@@ -276,12 +276,12 @@ class TestCrashRecovery:
         assert not any(".path.ovlock" in p for p in rm_calls)
         manager._journal.delete.assert_called_once_with("tx-innocent")
 
-    async def test_recover_aquire_status(self):
-        """AQUIRE status → same as INIT, clean up only."""
+    async def test_recover_acquire_status(self):
+        """ACQUIRE status → same as INIT, clean up only."""
         entries = {
             "tx-acq": {
                 "id": "tx-acq",
-                "status": "AQUIRE",
+                "status": "ACQUIRE",
                 "locks": ["/local/z/.path.ovlock"],
                 "created_at": time.time(),
                 "updated_at": time.time(),

@@ -251,7 +251,7 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 
 ```
 创建事务 → 写 journal（INIT）
-获取锁   → 更新 journal（AQUIRE → EXEC）
+获取锁   → 更新 journal（ACQUIRE → EXEC）
 执行变更 → 每步更新 journal（标记 undo entry completed）
 提交     → 更新 journal（COMMIT + post_actions）
          → 执行 post_actions → 删锁 → 删 journal
@@ -267,7 +267,7 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 | `COMMIT` + post_actions 非空 | 重放 post_actions → 删锁 → 删 journal |
 | `COMMIT` + post_actions 为空 / `RELEASED` | 删锁 → 删 journal |
 | `EXEC` / `FAIL` / `RELEASING` | 执行 undo log 回滚（`recover_all=True`） → 删锁 → 删 journal |
-| `INIT` / `AQUIRE` | 通过 init_info.lock_paths 清理孤儿锁 → 删 journal（变更未执行） |
+| `INIT` / `ACQUIRE` | 通过 init_info.lock_paths 清理孤儿锁 → 删 journal（变更未执行） |
 
 ### 防线总结
 
@@ -283,13 +283,13 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 ## 事务状态机
 
 ```
-INIT → AQUIRE → EXEC → COMMIT → RELEASING → RELEASED
+INIT → ACQUIRE → EXEC → COMMIT → RELEASING → RELEASED
                    ↓
                   FAIL → RELEASING → RELEASED
 ```
 
 - `INIT`：事务已创建，等待锁获取
-- `AQUIRE`：正在获取锁
+- `ACQUIRE`：正在获取锁
 - `EXEC`：事务操作执行中
 - `COMMIT`：已提交，可能有 post_actions 待执行
 - `FAIL`：执行失败，进入回滚
