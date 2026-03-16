@@ -221,7 +221,7 @@ class TransactionManager:
             # Pass recover_all=True so partial (completed=False) ops are also reversed,
             # e.g. a directory mv that started but never finished still leaves residue.
             try:
-                execute_rollback(
+                await execute_rollback(
                     tx.undo_log,
                     self._agfs,
                     vector_store=self._vector_store,
@@ -397,7 +397,7 @@ class TransactionManager:
         # Execute undo log (best-effort)
         if tx.undo_log:
             try:
-                execute_rollback(
+                await execute_rollback(
                     tx.undo_log,
                     self._agfs,
                     vector_store=self._vector_store,

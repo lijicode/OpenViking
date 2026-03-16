@@ -10,7 +10,7 @@ from .conftest import VECTOR_DIM, _mkdir_ok, file_exists
 
 
 class TestRmRollback:
-    def test_fs_rm_not_reversible(self, agfs_client, test_dir):
+    async def test_fs_rm_not_reversible(self, agfs_client, test_dir):
         """fs_rm is intentionally irreversible: even completed=True is a no-op."""
         path = f"{test_dir}/rm-target"
         _mkdir_ok(agfs_client, path)
@@ -18,14 +18,14 @@ class TestRmRollback:
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_rm", params={"uri": path}, completed=True),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # Directory still exists — fs_rm rollback does nothing
         assert file_exists(agfs_client, path)
 
 
 class TestMvRollback:
-    def test_mv_reversed_on_rollback(self, agfs_client, test_dir):
+    async def test_mv_reversed_on_rollback(self, agfs_client, test_dir):
         """Real mv → rollback → content back at original location."""
         src = f"{test_dir}/mv-src"
         dst = f"{test_dir}/mv-dst"
@@ -46,7 +46,7 @@ class TestMvRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         assert file_exists(agfs_client, src)
         restored = agfs_client.cat(f"{src}/payload.txt")
@@ -54,7 +54,7 @@ class TestMvRollback:
 
 
 class TestRecoverAll:
-    def test_recover_all_reverses_incomplete(self, agfs_client, test_dir):
+    async def test_recover_all_reverses_incomplete(self, agfs_client, test_dir):
         """recover_all=True also reverses entries with completed=False."""
         new_dir = f"{test_dir}/recover-all-dir"
         _mkdir_ok(agfs_client, new_dir)
@@ -62,11 +62,11 @@ class TestRecoverAll:
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=False),
         ]
-        execute_rollback(undo_log, agfs_client, recover_all=True)
+        await execute_rollback(undo_log, agfs_client, recover_all=True)
 
         assert not file_exists(agfs_client, new_dir)
 
-    def test_recover_all_false_skips_incomplete(self, agfs_client, test_dir):
+    async def test_recover_all_false_skips_incomplete(self, agfs_client, test_dir):
         """recover_all=False skips entries with completed=False."""
         new_dir = f"{test_dir}/skip-incomplete"
         _mkdir_ok(agfs_client, new_dir)
@@ -74,13 +74,13 @@ class TestRecoverAll:
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=False),
         ]
-        execute_rollback(undo_log, agfs_client, recover_all=False)
+        await execute_rollback(undo_log, agfs_client, recover_all=False)
 
         assert file_exists(agfs_client, new_dir)
 
 
 class TestMultiStepRollback:
-    def test_reverse_order_nested_dirs(self, agfs_client, test_dir):
+    async def test_reverse_order_nested_dirs(self, agfs_client, test_dir):
         """parent + child → rollback reverses in reverse sequence order."""
         parent = f"{test_dir}/multi-parent"
         child = f"{test_dir}/multi-parent/child"
@@ -91,12 +91,12 @@ class TestMultiStepRollback:
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": parent}, completed=True),
             UndoEntry(sequence=1, op_type="fs_mkdir", params={"uri": child}, completed=True),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         assert not file_exists(agfs_client, child)
         assert not file_exists(agfs_client, parent)
 
-    def test_write_new_rollback(self, agfs_client, test_dir):
+    async def test_write_new_rollback(self, agfs_client, test_dir):
         """New file → rollback → file deleted."""
         file_path = f"{test_dir}/new-file.txt"
         agfs_client.write(file_path, b"new content")
@@ -107,11 +107,11 @@ class TestMultiStepRollback:
                 sequence=0, op_type="fs_write_new", params={"uri": file_path}, completed=True
             ),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         assert not file_exists(agfs_client, file_path)
 
-    def test_best_effort_continues(self, agfs_client, test_dir):
+    async def test_best_effort_continues(self, agfs_client, test_dir):
         """If one step fails, subsequent steps still execute."""
         real_dir = f"{test_dir}/best-effort-real"
         _mkdir_ok(agfs_client, real_dir)
@@ -127,12 +127,12 @@ class TestMultiStepRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # seq=0 still executed despite seq=1 failure (reversed order: 1 runs first, then 0)
         assert not file_exists(agfs_client, real_dir)
 
-    def test_unknown_op_type_no_crash(self, agfs_client, test_dir):
+    async def test_unknown_op_type_no_crash(self, agfs_client, test_dir):
         """Unknown op_type is logged but doesn't raise."""
         undo_log = [
             UndoEntry(
@@ -143,7 +143,7 @@ class TestMultiStepRollback:
             ),
         ]
         # Should not raise
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
 
 class TestVectorDBRollback:
@@ -186,7 +186,7 @@ class TestVectorDBRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
         results = await vector_store.get([record_id], ctx=request_ctx)
         assert len(results) == 1
@@ -233,7 +233,7 @@ class TestVectorDBRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
         results = await vector_store.get(ids, ctx=request_ctx)
         assert len(results) == 3
@@ -255,7 +255,7 @@ class TestVectorDBRollback:
             ),
         ]
         # Should not raise
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
     async def test_vectordb_upsert_rollback_deletes(self, agfs_client, vector_store, request_ctx):
         """upsert → rollback(vectordb_upsert) → record deleted."""
@@ -288,7 +288,7 @@ class TestVectorDBRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
         results = await vector_store.get([record_id], ctx=request_ctx)
         assert len(results) == 0

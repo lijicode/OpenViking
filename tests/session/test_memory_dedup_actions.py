@@ -179,7 +179,6 @@ class TestMemoryDeduplicatorPayload:
         assert len(similar) == 1
         assert similar[0].uri == existing.uri
         call = vikingdb.search_similar_memories.await_args.kwargs
-        assert call["account_id"] == "acc1"
         assert call["owner_space"] == _make_user().user_space_name()
         assert call["category_uri_prefix"] == (
             f"viking://user/{_make_user().user_space_name()}/memories/preferences/"

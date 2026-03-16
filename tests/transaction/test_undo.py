@@ -39,7 +39,7 @@ class TestUndoEntry:
 class TestExecuteRollback:
     """Integration tests for execute_rollback using real AGFS and VectorDB backends."""
 
-    def test_rollback_fs_mv(self, agfs_client, test_dir):
+    async def test_rollback_fs_mv(self, agfs_client, test_dir):
         src = f"{test_dir}/src"
         dst = f"{test_dir}/dst"
         _mkdir_ok(agfs_client, src)
@@ -58,25 +58,25 @@ class TestExecuteRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # src restored, dst gone
         assert file_exists(agfs_client, src)
         assert not file_exists(agfs_client, dst)
 
-    def test_rollback_fs_rm_skipped(self, agfs_client, test_dir):
+    async def test_rollback_fs_rm_skipped(self, agfs_client, test_dir):
         path = f"{test_dir}/will-not-delete"
         _mkdir_ok(agfs_client, path)
 
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_rm", params={"uri": path}, completed=True),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # fs_rm rollback is a no-op; directory still exists
         assert file_exists(agfs_client, path)
 
-    def test_rollback_fs_mkdir(self, agfs_client, test_dir):
+    async def test_rollback_fs_mkdir(self, agfs_client, test_dir):
         new_dir = f"{test_dir}/created"
         _mkdir_ok(agfs_client, new_dir)
         assert file_exists(agfs_client, new_dir)
@@ -84,11 +84,11 @@ class TestExecuteRollback:
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=True),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         assert not file_exists(agfs_client, new_dir)
 
-    def test_rollback_fs_write_new(self, agfs_client, test_dir):
+    async def test_rollback_fs_write_new(self, agfs_client, test_dir):
         file_path = f"{test_dir}/new-file.txt"
         agfs_client.write(file_path, b"content")
         assert file_exists(agfs_client, file_path)
@@ -98,11 +98,11 @@ class TestExecuteRollback:
                 sequence=0, op_type="fs_write_new", params={"uri": file_path}, completed=True
             ),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         assert not file_exists(agfs_client, file_path)
 
-    def test_rollback_reverse_order(self, agfs_client, test_dir):
+    async def test_rollback_reverse_order(self, agfs_client, test_dir):
         """mkdir parent + child → rollback → both removed in reverse order."""
         parent = f"{test_dir}/parent"
         child = f"{test_dir}/parent/child"
@@ -113,25 +113,25 @@ class TestExecuteRollback:
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": parent}, completed=True),
             UndoEntry(sequence=1, op_type="fs_mkdir", params={"uri": child}, completed=True),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # child removed first (seq=1), then parent (seq=0)
         assert not file_exists(agfs_client, child)
         assert not file_exists(agfs_client, parent)
 
-    def test_rollback_skips_incomplete(self, agfs_client, test_dir):
+    async def test_rollback_skips_incomplete(self, agfs_client, test_dir):
         new_dir = f"{test_dir}/incomplete"
         _mkdir_ok(agfs_client, new_dir)
 
         undo_log = [
             UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=False),
         ]
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # completed=False → not rolled back
         assert file_exists(agfs_client, new_dir)
 
-    def test_rollback_best_effort(self, agfs_client, test_dir):
+    async def test_rollback_best_effort(self, agfs_client, test_dir):
         """A failing rollback entry should not prevent others from running."""
         real_dir = f"{test_dir}/real-dir"
         _mkdir_ok(agfs_client, real_dir)
@@ -152,7 +152,7 @@ class TestExecuteRollback:
             ),
         ]
         # Should not raise
-        execute_rollback(undo_log, agfs_client)
+        await execute_rollback(undo_log, agfs_client)
 
         # seq=0 mv rollback should have executed (dst → src)
         assert file_exists(agfs_client, src)
@@ -191,7 +191,7 @@ class TestExecuteRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
         results = await vector_store.get([record_id], ctx=request_ctx)
         assert len(results) == 0
@@ -242,7 +242,7 @@ class TestExecuteRollback:
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
+        await execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
         # URI should be restored to old_uri
         result = await vector_store.fetch_by_uri(old_uri, ctx=request_ctx)

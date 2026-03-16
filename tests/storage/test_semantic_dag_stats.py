@@ -76,7 +76,7 @@ async def test_semantic_dag_stats_collects_nodes(monkeypatch):
         AsyncMock(return_value=False),
     )
     monkeypatch.setattr(
-        "openviking.storage.transaction.transaction_manager.get_transaction_manager",
+        "openviking.storage.transaction.get_transaction_manager",
         lambda: MagicMock(),
     )
 

@@ -68,7 +68,7 @@ Storage Layer (VikingFS, VectorDB, QueueManager)
 事务流程：
 
 ```
-1. 开始事务，加锁（lock_mode="mv"，源路径 SUBTREE + 目标路径 POINT）
+1. 开始事务，加锁（lock_mode="mv"，目录移动时源和目标均 SUBTREE）
 2. 移动 FS 文件
 3. 更新 VectorDB 中的 URI
 4. 提交 → 删锁 → 删 journal
@@ -151,8 +151,8 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 | lock_mode | 用途 | 行为 |
 |-----------|------|------|
 | `point` | 写操作 | 锁定指定路径；与同路径的任何锁和祖先目录的 SUBTREE 锁冲突 |
-| `subtree` | 删除操作 | 锁定子树根节点；与同路径的任何锁和后代目录的任何锁冲突 |
-| `mv` | 移动操作 | 源路径加 SUBTREE 锁，目标路径加 POINT 锁 |
+| `subtree` | 删除操作 | 锁定子树根节点；与同路径的任何锁、后代目录的任何锁和祖先目录的 SUBTREE 锁冲突 |
+| `mv` | 移动操作 | 目录移动：源和目标均加 SUBTREE 锁；文件移动：源父目录和目标均加 POINT 锁（通过 `src_is_dir` 控制） |
 
 ## 锁类型（POINT vs SUBTREE）
 
@@ -161,10 +161,10 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 | | 同路径 POINT | 同路径 SUBTREE | 后代 POINT | 祖先 SUBTREE |
 |---|---|---|---|---|
 | **POINT** | 冲突 | 冲突 | — | 冲突 |
-| **SUBTREE** | 冲突 | 冲突 | 冲突 | — |
+| **SUBTREE** | 冲突 | 冲突 | 冲突 | 冲突 |
 
 - **POINT (P)**：用于写操作和语义处理。只锁单个目录。若祖先目录持有 SUBTREE 锁则阻塞。
-- **SUBTREE (S)**：用于删除和移动源操作。逻辑上覆盖整个子树，但只在根目录写**一个锁文件**。获取前扫描所有后代确认无冲突锁。
+- **SUBTREE (S)**：用于删除和移动操作。逻辑上覆盖整个子树，但只在根目录写**一个锁文件**。获取前扫描所有后代和祖先目录确认无冲突锁。
 
 ## Undo Log
 
@@ -181,6 +181,17 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 | `vectordb_update_uri` | 更新 URI | 恢复旧值 |
 
 回滚规则：只回滚 `completed=True` 的条目，**反序执行**。每步独立 try-catch（best-effort）。崩溃恢复时使用 `recover_all=True`，也会回滚未完成的条目以清理部分操作残留。
+
+### 上下文重建
+
+VectorDB 回滚操作需要 `RequestContext`（包含 account_id、user_id、agent_id、role）。由于崩溃恢复时原始上下文不可用，record_undo 时在 undo params 中序列化 `_ctx_*` 字段：
+
+- `_ctx_account_id`：账户 ID
+- `_ctx_user_id`：用户 ID
+- `_ctx_agent_id`：代理 ID
+- `_ctx_role`：角色
+
+回滚时通过 `_reconstruct_ctx()` 从这些字段重建上下文。若重建失败（字段缺失），该 VectorDB 回滚步骤将被跳过并记录警告。
 
 ## 锁机制
 
@@ -223,12 +234,23 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 循环直到超时（轮询间隔：200ms）：
     1. 检查目标目录存在
     2. 检查目标路径是否被其他事务锁定
-    3. 扫描所有后代目录，检查是否有其他事务持有的锁
-    4. 写入 SUBTREE (S) 锁文件（只写一个文件，在根路径）
-    5. TOCTOU 双重检查：重新扫描后代目录
-       - 发现冲突：后到者主动让步（活锁防止）
-    6. 验证锁文件归属
-    7. 成功
+       - 陈旧锁？ → 移除后重试
+       - 活跃锁？ → 等待
+    3. 检查所有祖先目录是否有 SUBTREE 锁
+       - 陈旧锁？ → 移除后重试
+       - 活跃锁？ → 等待
+    4. 扫描所有后代目录，检查是否有其他事务持有的锁
+       - 陈旧锁？ → 移除后重试
+       - 活跃锁？ → 等待
+    5. 写入 SUBTREE (S) 锁文件（只写一个文件，在根路径）
+    6. TOCTOU 双重检查：重新扫描后代目录和祖先目录
+       - 发现冲突：比较 (timestamp, tx_id)
+       - 后到者（更大的 timestamp/tx_id）主动让步（删除自己的锁），防止活锁
+       - 等待后重试
+    7. 验证锁文件归属（fencing token 匹配）
+    8. 成功
+
+超时（默认 0 = 不等待）抛出 LockAcquisitionError
 ```
 
 ### 锁过期清理
@@ -305,8 +327,7 @@ INIT → ACQUIRE → EXEC → COMMIT → RELEASING → RELEASED
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 300.0,
-      "max_parallel_locks": 8
+      "lock_expire": 300.0
     }
   }
 }
@@ -316,7 +337,6 @@ INIT → ACQUIRE → EXEC → COMMIT → RELEASING → RELEASED
 |------|------|------|--------|
 | `lock_timeout` | float | 获取锁的等待超时（秒）。`0` = 立即失败（默认）；`> 0` = 最多等待此时间 | `0.0` |
 | `lock_expire` | float | 锁过期时间（秒），超过此时间的事务锁将被视为陈旧锁并强制释放 | `300.0` |
-| `max_parallel_locks` | int | rm/mv 操作的最大并行加锁数 | `8` |
 
 ### QueueFS 持久化
 

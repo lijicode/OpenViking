@@ -68,7 +68,7 @@ Rollback: Step 4 fails -> restore VectorDB records from snapshot.
 Transaction flow:
 
 ```
-1. Begin transaction, acquire lock (lock_mode="mv", SUBTREE on source + POINT on destination)
+1. Begin transaction, acquire lock (lock_mode="mv", SUBTREE on both source and destination for directories)
 2. Move FS file
 3. Update VectorDB URIs
 4. Commit -> release lock -> delete journal
@@ -151,8 +151,8 @@ async with TransactionContext(tx_manager, "rm", [path], lock_mode="subtree") as 
 | lock_mode | Use case | Behavior |
 |-----------|----------|----------|
 | `point` | Write operations | Lock the specified path; conflicts with any lock on the same path and any SUBTREE lock on ancestors |
-| `subtree` | Delete operations | Lock the subtree root; conflicts with any lock on the same path and any lock on descendants |
-| `mv` | Move operations | Acquire SUBTREE lock on source path, then POINT lock on destination path |
+| `subtree` | Delete operations | Lock the subtree root; conflicts with any lock on the same path, any lock on descendants, and any SUBTREE lock on ancestors |
+| `mv` | Move operations | Directory move: SUBTREE lock on both source and destination; File move: POINT lock on source parent and destination (controlled by `src_is_dir`) |
 
 ## Lock Types (POINT vs SUBTREE)
 
@@ -161,10 +161,10 @@ The lock mechanism uses two lock types to handle different conflict patterns:
 | | POINT on same path | SUBTREE on same path | POINT on descendant | SUBTREE on ancestor |
 |---|---|---|---|---|
 | **POINT** | Conflict | Conflict | — | Conflict |
-| **SUBTREE** | Conflict | Conflict | Conflict | — |
+| **SUBTREE** | Conflict | Conflict | Conflict | Conflict |
 
 - **POINT (P)**: Used for write and semantic-processing operations. Only locks a single directory. Blocks if any ancestor holds a SUBTREE lock.
-- **SUBTREE (S)**: Used for rm and mv-source operations. Logically covers the entire subtree but only writes **one lock file** at the root. Before acquiring, scans all descendants for conflicting locks.
+- **SUBTREE (S)**: Used for rm and mv operations. Logically covers the entire subtree but only writes **one lock file** at the root. Before acquiring, scans all descendants and ancestor directories for conflicting locks.
 
 ## Undo Log
 
@@ -181,6 +181,17 @@ Each transaction maintains an Undo Log recording the reverse action for each ste
 | `vectordb_update_uri` | Update URI | Restore old value |
 
 Rollback rules: Only entries with `completed=True` are rolled back, in **reverse order**. Each step has independent try-catch (best-effort). During crash recovery, `recover_all=True` also reverses uncompleted entries to clean up partial operations.
+
+### Context Reconstruction
+
+VectorDB rollback operations require a `RequestContext` (containing account_id, user_id, agent_id, role). Since the original context is unavailable during crash recovery, `_ctx_*` fields are serialized into undo params when calling record_undo:
+
+- `_ctx_account_id`: Account ID
+- `_ctx_user_id`: User ID
+- `_ctx_agent_id`: Agent ID
+- `_ctx_role`: Role
+
+During rollback, `_reconstruct_ctx()` rebuilds the context from these fields. If reconstruction fails (missing fields), the VectorDB rollback step is skipped with a warning.
 
 ## Lock Mechanism
 
@@ -223,12 +234,23 @@ Timeout (default 0 = no-wait) raises LockAcquisitionError
 loop until timeout (poll interval: 200ms):
     1. Check target directory exists
     2. Check if target directory is locked by another transaction
-    3. Scan all descendant directories for any locks by other transactions
-    4. Write SUBTREE (S) lock file (only one file, at the root path)
-    5. TOCTOU double-check: re-scan descendants for new locks
-       - Conflict found: later one backs off (livelock prevention)
-    6. Verify lock file ownership
-    7. Success
+       - Stale lock? -> remove and retry
+       - Active lock? -> wait
+    3. Check all ancestor directories for SUBTREE locks
+       - Stale lock? -> remove and retry
+       - Active lock? -> wait
+    4. Scan all descendant directories for any locks by other transactions
+       - Stale lock? -> remove and retry
+       - Active lock? -> wait
+    5. Write SUBTREE (S) lock file (only one file, at the root path)
+    6. TOCTOU double-check: re-scan descendants and ancestors
+       - Conflict found: compare (timestamp, tx_id)
+       - Later one (larger timestamp/tx_id) backs off (removes own lock) to prevent livelock
+       - Wait and retry
+    7. Verify lock file ownership (fencing token matches)
+    8. Success
+
+Timeout (default 0 = no-wait) raises LockAcquisitionError
 ```
 
 ### Lock Expiry Cleanup
@@ -305,8 +327,7 @@ The transaction mechanism is enabled by default with no extra configuration need
   "storage": {
     "transaction": {
       "lock_timeout": 5.0,
-      "lock_expire": 300.0,
-      "max_parallel_locks": 8
+      "lock_expire": 300.0
     }
   }
 }
@@ -316,7 +337,6 @@ The transaction mechanism is enabled by default with no extra configuration need
 |-----------|------|-------------|---------|
 | `lock_timeout` | float | Lock acquisition timeout (seconds). `0` = fail immediately if locked (default). `> 0` = wait/retry up to this many seconds. | `0.0` |
 | `lock_expire` | float | Stale lock expiry threshold (seconds). Locks held longer than this by a crashed process are force-released. | `300.0` |
-| `max_parallel_locks` | int | Max parallel locks for rm/mv operations | `8` |
 
 ### QueueFS Persistence
 

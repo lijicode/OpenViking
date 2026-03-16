@@ -73,7 +73,7 @@ class UndoEntry:
         )
 
 
-def execute_rollback(
+async def execute_rollback(
     undo_log: List[UndoEntry],
     agfs: Any,
     vector_store: Optional[Any] = None,
@@ -102,7 +102,7 @@ def execute_rollback(
 
     for entry in entries:
         try:
-            _rollback_entry(entry, agfs, vector_store, ctx)
+            await _rollback_entry(entry, agfs, vector_store, ctx)
             logger.info(f"[Rollback] Reversed {entry.op_type} seq={entry.sequence}")
         except Exception as e:
             logger.warning(
@@ -110,15 +110,13 @@ def execute_rollback(
             )
 
 
-def _rollback_entry(
+async def _rollback_entry(
     entry: UndoEntry,
     agfs: Any,
     vector_store: Optional[Any],
     ctx: Optional[Any],
 ) -> None:
     """Dispatch rollback for a single undo entry."""
-    from openviking_cli.utils import run_async
-
     op = entry.op_type
     params = entry.params
 
@@ -146,7 +144,7 @@ def _rollback_entry(
             if record_id:
                 restored_ctx = _reconstruct_ctx(params)
                 if restored_ctx:
-                    run_async(vector_store.delete([record_id], ctx=restored_ctx))
+                    await vector_store.delete([record_id], ctx=restored_ctx)
                 else:
                     logger.warning("[Rollback] vectordb_upsert: cannot reconstruct ctx, skipping")
 
@@ -159,7 +157,7 @@ def _rollback_entry(
                 records_snapshot = params.get("records_snapshot", [])
                 for record in records_snapshot:
                     try:
-                        run_async(vector_store.upsert(record, ctx=restored_ctx))
+                        await vector_store.upsert(record, ctx=restored_ctx)
                     except Exception as e:
                         logger.warning(f"[Rollback] Failed to restore vector record: {e}")
 
@@ -169,13 +167,11 @@ def _rollback_entry(
             if restored_ctx is None:
                 logger.warning("[Rollback] vectordb_update_uri: cannot reconstruct ctx, skipping")
             else:
-                run_async(
-                    vector_store.update_uri_mapping(
-                        ctx=restored_ctx,
-                        uri=params["new_uri"],
-                        new_uri=params["old_uri"],
-                        new_parent_uri=params.get("old_parent_uri", ""),
-                    )
+                await vector_store.update_uri_mapping(
+                    ctx=restored_ctx,
+                    uri=params["new_uri"],
+                    new_uri=params["old_uri"],
+                    new_parent_uri=params.get("old_parent_uri", ""),
                 )
 
     else:

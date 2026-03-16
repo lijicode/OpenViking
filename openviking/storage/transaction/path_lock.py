@@ -159,7 +159,7 @@ class PathLock:
     ) -> bool:
         transaction_id = transaction.id
         lock_path = self._get_lock_path(path)
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
 
         try:
             self._agfs.stat(path)
@@ -172,12 +172,12 @@ class PathLock:
                 if self.is_lock_stale(lock_path, self._lock_expire):
                     logger.warning(f"[POINT] Removing stale lock: {lock_path}")
                     await self._remove_lock_file(lock_path)
-                    if asyncio.get_event_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= deadline:
                         logger.warning(f"[POINT] Timeout waiting for lock on: {path}")
                         return False
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     logger.warning(f"[POINT] Timeout waiting for lock on: {path}")
                     return False
                 await asyncio.sleep(_POLL_INTERVAL)
@@ -190,14 +190,14 @@ class PathLock:
                         f"[POINT] Removing stale ancestor SUBTREE lock: {ancestor_conflict}"
                     )
                     await self._remove_lock_file(ancestor_conflict)
-                    if asyncio.get_event_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= deadline:
                         logger.warning(
                             f"[POINT] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
                         )
                         return False
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     logger.warning(
                         f"[POINT] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
                     )
@@ -225,7 +225,7 @@ class PathLock:
                         logger.debug(f"[POINT] Backing off (livelock guard) on {path}")
                         await self._remove_lock_file(lock_path)
                         backed_off = True
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     if not backed_off:
                         await self._remove_lock_file(lock_path)
                     return False
@@ -234,7 +234,7 @@ class PathLock:
 
             if not await self._verify_lock_ownership(lock_path, transaction_id):
                 logger.debug(f"[POINT] Lock ownership verification failed: {path}")
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     return False
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
@@ -248,7 +248,7 @@ class PathLock:
     ) -> bool:
         transaction_id = transaction.id
         lock_path = self._get_lock_path(path)
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
 
         try:
             self._agfs.stat(path)
@@ -261,12 +261,12 @@ class PathLock:
                 if self.is_lock_stale(lock_path, self._lock_expire):
                     logger.warning(f"[SUBTREE] Removing stale lock: {lock_path}")
                     await self._remove_lock_file(lock_path)
-                    if asyncio.get_event_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= deadline:
                         logger.warning(f"[SUBTREE] Timeout waiting for lock on: {path}")
                         return False
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     logger.warning(f"[SUBTREE] Timeout waiting for lock on: {path}")
                     return False
                 await asyncio.sleep(_POLL_INTERVAL)
@@ -280,14 +280,14 @@ class PathLock:
                         f"[SUBTREE] Removing stale ancestor SUBTREE lock: {ancestor_conflict}"
                     )
                     await self._remove_lock_file(ancestor_conflict)
-                    if asyncio.get_event_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= deadline:
                         logger.warning(
                             f"[SUBTREE] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
                         )
                         return False
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     logger.warning(
                         f"[SUBTREE] Timeout waiting for ancestor SUBTREE lock: {ancestor_conflict}"
                     )
@@ -300,14 +300,14 @@ class PathLock:
                 if self.is_lock_stale(desc_conflict, self._lock_expire):
                     logger.warning(f"[SUBTREE] Removing stale descendant lock: {desc_conflict}")
                     await self._remove_lock_file(desc_conflict)
-                    if asyncio.get_event_loop().time() >= deadline:
+                    if asyncio.get_running_loop().time() >= deadline:
                         logger.warning(
                             f"[SUBTREE] Timeout waiting for descendant lock: {desc_conflict}"
                         )
                         return False
                     await asyncio.sleep(_POLL_INTERVAL)
                     continue
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     logger.warning(
                         f"[SUBTREE] Timeout waiting for descendant lock: {desc_conflict}"
                     )
@@ -337,7 +337,7 @@ class PathLock:
                         logger.debug(f"[SUBTREE] Backing off (livelock guard) on {path}")
                         await self._remove_lock_file(lock_path)
                         backed_off = True
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     if not backed_off:
                         await self._remove_lock_file(lock_path)
                     return False
@@ -346,7 +346,7 @@ class PathLock:
 
             if not await self._verify_lock_ownership(lock_path, transaction_id):
                 logger.debug(f"[SUBTREE] Lock ownership verification failed: {path}")
-                if asyncio.get_event_loop().time() >= deadline:
+                if asyncio.get_running_loop().time() >= deadline:
                     return False
                 await asyncio.sleep(_POLL_INTERVAL)
                 continue
