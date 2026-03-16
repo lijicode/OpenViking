@@ -1,385 +1,561 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Integration test: crash recovery from journal."""
+"""Integration test: crash recovery from journal using real AGFS and VectorDB backends."""
 
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
+import uuid
+from unittest.mock import AsyncMock, patch
 
+from openviking.storage.transaction.journal import TransactionJournal
 from openviking.storage.transaction.transaction_manager import TransactionManager
+from openviking.storage.transaction.transaction_record import (
+    TransactionRecord,
+    TransactionStatus,
+)
+from openviking.storage.transaction.undo import UndoEntry
+
+from .conftest import VECTOR_DIM, _mkdir_ok, file_exists, make_lock_file
+
+
+def _write_journal(journal, record):
+    """Write a TransactionRecord to real journal storage."""
+    journal.write(record.to_journal())
 
 
 class TestCrashRecovery:
-    def _make_manager(self, journal_entries=None):
-        """Create a TransactionManager with mocked AGFS and journal data."""
-        agfs = MagicMock()
-        manager = TransactionManager(agfs_client=agfs, timeout=3600)
+    """
+    Core technique: simulate crash recovery.
 
-        if journal_entries:
-            manager._journal = MagicMock()
-            manager._journal.list_all.return_value = list(journal_entries.keys())
-            manager._journal.read.side_effect = lambda tx_id: journal_entries[tx_id]
-            manager._journal.delete = MagicMock()
-        else:
-            manager._journal = MagicMock()
-            manager._journal.list_all.return_value = []
+    1. Create real FS state via agfs_client
+    2. Build TransactionRecord, write to real journal
+    3. Create fresh TransactionManager (simulates process restart)
+    4. Call manager._recover_pending_transactions()
+    5. Verify final state via agfs_client.stat()/cat() and vector_store.get()
+    """
 
-        return manager, agfs
+    async def test_recover_commit_no_rollback(self, agfs_client, vector_store, test_dir):
+        """COMMIT status → committed files NOT rolled back, journal cleaned up."""
+        # Create a file that was part of a committed transaction
+        committed_file = f"{test_dir}/committed.txt"
+        agfs_client.write(committed_file, b"committed data")
 
-    async def test_recover_committed_with_post_actions(self):
-        """COMMIT + post_actions → replay post_actions, clean up."""
-        entries = {
-            "tx-1": {
-                "id": "tx-1",
-                "status": "COMMIT",
-                "locks": ["/local/test/.path.ovlock"],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [
-                    {
-                        "type": "enqueue_semantic",
-                        "params": {
-                            "uri": "viking://test",
-                            "context_type": "resource",
-                            "account_id": "acc",
-                        },
-                    }
-                ],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-commit-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.COMMIT,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_write_new",
+                    params={"uri": committed_file},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
 
-        with patch(
-            "openviking.storage.transaction.transaction_manager.TransactionManager._execute_post_actions",
-            new_callable=AsyncMock,
-        ) as mock_post:
+        # New manager (simulates restart)
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+        await manager._recover_pending_transactions()
+
+        # File should still exist (no rollback for committed tx)
+        assert file_exists(agfs_client, committed_file)
+        # Journal should be cleaned up
+        assert tx_id not in journal.list_all()
+
+    async def test_recover_commit_replays_post_actions(self, agfs_client, vector_store, test_dir):
+        """COMMIT + post_actions → replay post_actions."""
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-post-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.COMMIT,
+            locks=[],
+            undo_log=[],
+            post_actions=[
+                {
+                    "type": "enqueue_semantic",
+                    "params": {
+                        "uri": "viking://test-post",
+                        "context_type": "resource",
+                        "account_id": "acc",
+                    },
+                }
+            ],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+
+        with patch.object(manager, "_execute_post_actions", new_callable=AsyncMock) as mock_post:
             await manager._recover_pending_transactions()
 
         mock_post.assert_called_once()
-        agfs.rm.assert_called_once_with("/local/test/.path.ovlock")
-        manager._journal.delete.assert_called_once_with("tx-1")
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_committed_no_post_actions(self):
-        """COMMIT + no post_actions → just clean up, no rollback."""
-        entries = {
-            "tx-2": {
-                "id": "tx-2",
-                "status": "COMMIT",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [
-                    # Even if undo_log has entries, COMMIT should NOT rollback
-                    {
-                        "sequence": 0,
-                        "op_type": "fs_mv",
-                        "params": {"src": "/a", "dst": "/b"},
-                        "completed": True,
-                    }
-                ],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_exec_rollback_fs_mv(self, agfs_client, vector_store, test_dir):
+        """EXEC status with fs_mv → recovery rolls back → file moved back."""
+        src = f"{test_dir}/exec-mv-src"
+        dst = f"{test_dir}/exec-mv-dst"
+        _mkdir_ok(agfs_client, src)
+        agfs_client.write(f"{src}/data.txt", b"mv-data")
+
+        # Simulate: forward mv happened, then crash
+        agfs_client.mv(src, dst)
+        assert not file_exists(agfs_client, src)
+
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-exec-mv-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mv",
+                    params={"src": src, "dst": dst},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.mv.assert_not_called()  # No rollback for committed transactions
-        manager._journal.delete.assert_called_once_with("tx-2")
+        assert file_exists(agfs_client, src)
+        assert not file_exists(agfs_client, dst)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_exec_triggers_rollback(self):
-        """EXEC status → execute rollback regardless of transaction age."""
-        entries = {
-            "tx-3": {
-                "id": "tx-3",
-                "status": "EXEC",
-                "locks": ["/local/x/.path.ovlock"],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [
-                    {
-                        "sequence": 0,
-                        "op_type": "fs_mv",
-                        "params": {"src": "/local/a", "dst": "/local/b"},
-                        "completed": True,
-                    }
-                ],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_exec_rollback_fs_mkdir(self, agfs_client, vector_store, test_dir):
+        """EXEC with fs_mkdir → recovery → directory removed."""
+        new_dir = f"{test_dir}/exec-mkdir"
+        _mkdir_ok(agfs_client, new_dir)
+
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-exec-mkdir-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": new_dir},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.mv.assert_called_once_with("/local/b", "/local/a")
-        manager._journal.delete.assert_called_once_with("tx-3")
+        assert not file_exists(agfs_client, new_dir)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_fail_triggers_rollback(self):
-        """FAIL status → execute rollback."""
-        entries = {
-            "tx-fail": {
-                "id": "tx-fail",
-                "status": "FAIL",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [
-                    {
-                        "sequence": 0,
-                        "op_type": "fs_mkdir",
-                        "params": {"uri": "/local/newdir"},
-                        "completed": True,
-                    }
-                ],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_exec_rollback_fs_write_new(self, agfs_client, vector_store, test_dir):
+        """EXEC with fs_write_new → recovery → file removed."""
+        file_path = f"{test_dir}/exec-write.txt"
+        agfs_client.write(file_path, b"to-be-rolled-back")
+
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-exec-write-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_write_new",
+                    params={"uri": file_path},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.rm.assert_called_once_with("/local/newdir")
-        manager._journal.delete.assert_called_once_with("tx-fail")
+        assert not file_exists(agfs_client, file_path)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_exec_recover_all_includes_incomplete(self):
-        """EXEC recovery uses recover_all=True: also reverses incomplete entries."""
-        entries = {
-            "tx-partial": {
-                "id": "tx-partial",
-                "status": "EXEC",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [
-                    {
-                        "sequence": 0,
-                        "op_type": "fs_mv",
-                        "params": {"src": "/local/a", "dst": "/local/b"},
-                        "completed": False,  # not completed, but recover_all=True should still reverse it
-                    }
-                ],
-                "post_actions": [],
-            }
+    async def test_recover_exec_rollback_vectordb_upsert(
+        self, agfs_client, vector_store, request_ctx, test_dir
+    ):
+        """EXEC with vectordb_upsert → recovery → record deleted from VectorDB."""
+        record_id = str(uuid.uuid4())
+        record = {
+            "id": record_id,
+            "uri": f"viking://resources/crash-upsert-{record_id}.md",
+            "parent_uri": "viking://resources/",
+            "account_id": "default",
+            "context_type": "resource",
+            "level": 2,
+            "vector": [0.5] * VECTOR_DIM,
+            "name": "crash-upsert",
+            "description": "test",
+            "abstract": "test",
         }
-        manager, agfs = self._make_manager(entries)
+        await vector_store.upsert(record, ctx=request_ctx)
+        assert len(await vector_store.get([record_id], ctx=request_ctx)) == 1
+
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-exec-vdb-{uuid.uuid4().hex[:8]}"
+        tx_record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="vectordb_upsert",
+                    params={
+                        "record_id": record_id,
+                        "_ctx_account_id": "default",
+                        "_ctx_user_id": "test_user",
+                        "_ctx_role": "root",
+                    },
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, tx_record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.mv.assert_called_once_with("/local/b", "/local/a")
-        manager._journal.delete.assert_called_once_with("tx-partial")
+        results = await vector_store.get([record_id], ctx=request_ctx)
+        assert len(results) == 0
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_init_just_cleans_up(self):
-        """INIT status → no rollback (nothing executed), just release locks and clean journal."""
-        entries = {
-            "tx-4": {
-                "id": "tx-4",
-                "status": "INIT",
-                "locks": ["/local/y/.path.ovlock"],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_fail_triggers_rollback(self, agfs_client, vector_store, test_dir):
+        """FAIL status → also triggers rollback."""
+        new_dir = f"{test_dir}/fail-dir"
+        _mkdir_ok(agfs_client, new_dir)
+
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-fail-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.FAIL,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": new_dir},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.rm.assert_called_once_with("/local/y/.path.ovlock")
-        manager._journal.delete.assert_called_once_with("tx-4")
+        assert not file_exists(agfs_client, new_dir)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_multiple_transactions(self):
-        """Multiple journals are all recovered."""
-        entries = {
-            "tx-a": {
-                "id": "tx-a",
-                "status": "INIT",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            },
-            "tx-b": {
-                "id": "tx-b",
-                "status": "COMMIT",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            },
-        }
-        manager, agfs = self._make_manager(entries)
-        await manager._recover_pending_transactions()
-        assert manager._journal.delete.call_count == 2
+    async def test_recover_releasing_triggers_rollback(self, agfs_client, vector_store, test_dir):
+        """RELEASING status → rollback + lock cleanup."""
+        new_dir = f"{test_dir}/releasing-dir"
+        _mkdir_ok(agfs_client, new_dir)
 
-    async def test_recover_init_empty_locks_cleans_orphan_via_init_info(self):
-        """INIT with empty locks but init_info.lock_paths → clean up orphan lock files."""
-        entries = {
-            "tx-orphan": {
-                "id": "tx-orphan",
-                "status": "INIT",
-                "locks": [],  # Empty: crash happened before journal recorded locks
-                "init_info": {
-                    "operation": "rm",
-                    "lock_paths": ["/local/orphan-dir"],
-                    "lock_mode": "subtree",
-                },
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+        lock_path = make_lock_file(agfs_client, test_dir, "tx-releasing-placeholder", "S")
 
-        # Simulate: the lock file exists and is owned by this transaction
-        from openviking.storage.transaction.path_lock import _make_fencing_token
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-releasing-{uuid.uuid4().hex[:8]}"
+        # Rewrite lock with correct tx_id
+        lock_path = make_lock_file(agfs_client, test_dir, tx_id, "S")
 
-        token = _make_fencing_token("tx-orphan", "S")
-        agfs.cat.return_value = token.encode("utf-8")
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.RELEASING,
+            locks=[lock_path],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": new_dir},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
 
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        # Should have removed the orphan lock file
-        agfs.rm.assert_called()
-        rm_paths = [call[0][0] for call in agfs.rm.call_args_list]
-        assert any(".path.ovlock" in p for p in rm_paths)
-        manager._journal.delete.assert_called_once_with("tx-orphan")
+        assert not file_exists(agfs_client, new_dir)
+        assert not file_exists(agfs_client, lock_path)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_init_orphan_lock_owned_by_other_tx_not_removed(self):
-        """INIT with orphan lock path, but lock file owned by a different tx → not removed."""
-        entries = {
-            "tx-innocent": {
-                "id": "tx-innocent",
-                "status": "INIT",
-                "locks": [],
-                "init_info": {
-                    "operation": "rm",
-                    "lock_paths": ["/local/shared-dir"],
-                    "lock_mode": "subtree",
-                },
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_exec_includes_incomplete(self, agfs_client, vector_store, test_dir):
+        """EXEC recovery uses recover_all=True → also reverses incomplete entries."""
+        new_dir = f"{test_dir}/exec-incomplete"
+        _mkdir_ok(agfs_client, new_dir)
 
-        # Lock file owned by a different transaction
-        from openviking.storage.transaction.path_lock import _make_fencing_token
+        journal = TransactionJournal(agfs_client)
+        tx_id = f"tx-exec-inc-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": new_dir},
+                    completed=False,  # incomplete, but recover_all=True reverses it
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
 
-        token = _make_fencing_token("tx-OTHER-owner", "S")
-        agfs.cat.return_value = token.encode("utf-8")
-
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        # rm should NOT be called for the lock file (only journal delete)
-        rm_calls = [call[0][0] for call in agfs.rm.call_args_list] if agfs.rm.called else []
-        assert not any(".path.ovlock" in p for p in rm_calls)
-        manager._journal.delete.assert_called_once_with("tx-innocent")
+        assert not file_exists(agfs_client, new_dir)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_acquire_status(self):
+    async def test_recover_init_cleans_locks(self, agfs_client, vector_store, test_dir):
+        """INIT status → no rollback, just lock cleanup + journal delete."""
+        lock_dir = f"{test_dir}/init-lock-dir"
+        _mkdir_ok(agfs_client, lock_dir)
+
+        tx_id = f"tx-init-{uuid.uuid4().hex[:8]}"
+        lock_path = make_lock_file(agfs_client, lock_dir, tx_id, "P")
+
+        journal = TransactionJournal(agfs_client)
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.INIT,
+            locks=[lock_path],
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+        await manager._recover_pending_transactions()
+
+        assert not file_exists(agfs_client, lock_path)
+        assert tx_id not in journal.list_all()
+
+    async def test_recover_acquire_cleans_locks(self, agfs_client, vector_store, test_dir):
         """ACQUIRE status → same as INIT, clean up only."""
-        entries = {
-            "tx-acq": {
-                "id": "tx-acq",
-                "status": "ACQUIRE",
-                "locks": ["/local/z/.path.ovlock"],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+        lock_dir = f"{test_dir}/acquire-lock-dir"
+        _mkdir_ok(agfs_client, lock_dir)
+
+        tx_id = f"tx-acq-{uuid.uuid4().hex[:8]}"
+        lock_path = make_lock_file(agfs_client, lock_dir, tx_id, "P")
+
+        journal = TransactionJournal(agfs_client)
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.ACQUIRE,
+            locks=[lock_path],
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        agfs.rm.assert_called_once_with("/local/z/.path.ovlock")
-        manager._journal.delete.assert_called_once_with("tx-acq")
+        assert not file_exists(agfs_client, lock_path)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_releasing_status_triggers_rollback(self):
-        """RELEASING status → process crashed while releasing, rollback undo log."""
-        entries = {
-            "tx-rel": {
-                "id": "tx-rel",
-                "status": "RELEASING",
-                "locks": ["/local/r/.path.ovlock"],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [
-                    {
-                        "sequence": 0,
-                        "op_type": "fs_mkdir",
-                        "params": {"uri": "/local/tmpdir"},
-                        "completed": True,
-                    }
-                ],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_init_orphan_lock_via_init_info(
+        self, agfs_client, vector_store, test_dir
+    ):
+        """INIT with empty locks but init_info.lock_paths → clean orphan lock owned by tx."""
+        orphan_dir = f"{test_dir}/orphan-dir"
+        _mkdir_ok(agfs_client, orphan_dir)
+
+        tx_id = f"tx-orphan-{uuid.uuid4().hex[:8]}"
+        lock_path = make_lock_file(agfs_client, orphan_dir, tx_id, "S")
+
+        journal = TransactionJournal(agfs_client)
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.INIT,
+            locks=[],  # Empty — crash happened before journal recorded locks
+            init_info={
+                "operation": "rm",
+                "lock_paths": [orphan_dir],
+                "lock_mode": "subtree",
+            },
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        # Should rollback the undo log
-        rm_paths = [call[0][0] for call in agfs.rm.call_args_list]
-        assert "/local/tmpdir" in rm_paths
-        manager._journal.delete.assert_called_once_with("tx-rel")
+        assert not file_exists(agfs_client, lock_path)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_mv_orphan_locks_include_dst(self):
-        """INIT mv operation with init_info → check both lock_paths and mv_dst_path for orphan locks."""
-        entries = {
-            "tx-mv-orphan": {
-                "id": "tx-mv-orphan",
-                "status": "INIT",
-                "locks": [],
-                "init_info": {
-                    "operation": "mv",
-                    "lock_paths": ["/local/src-dir"],
-                    "lock_mode": "mv",
-                    "mv_dst_path": "/local/dst-dir",
-                },
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
-        }
-        manager, agfs = self._make_manager(entries)
+    async def test_recover_init_orphan_lock_other_owner(self, agfs_client, vector_store, test_dir):
+        """INIT with orphan lock owned by different tx → not removed."""
+        orphan_dir = f"{test_dir}/orphan-other"
+        _mkdir_ok(agfs_client, orphan_dir)
 
-        from openviking.storage.transaction.path_lock import _make_fencing_token
+        other_tx_id = f"tx-OTHER-{uuid.uuid4().hex[:8]}"
+        lock_path = make_lock_file(agfs_client, orphan_dir, other_tx_id, "S")
 
-        token = _make_fencing_token("tx-mv-orphan", "P")
-        agfs.cat.return_value = token.encode("utf-8")
+        tx_id = f"tx-innocent-{uuid.uuid4().hex[:8]}"
+        journal = TransactionJournal(agfs_client)
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.INIT,
+            locks=[],
+            init_info={
+                "operation": "rm",
+                "lock_paths": [orphan_dir],
+                "lock_mode": "subtree",
+            },
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
 
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        # Should check both src and dst paths for orphan locks
-        cat_paths = [call[0][0] for call in agfs.cat.call_args_list]
-        assert any("src-dir" in p for p in cat_paths)
-        assert any("dst-dir" in p for p in cat_paths)
+        # Lock file should still exist — owned by different tx
+        assert file_exists(agfs_client, lock_path)
+        assert tx_id not in journal.list_all()
 
-    async def test_recover_journal_read_failure_skips_gracefully(self):
-        """If reading a journal entry fails, skip that tx and continue with others."""
-        agfs = MagicMock()
-        manager = TransactionManager(agfs_client=agfs, timeout=3600)
-        manager._journal = MagicMock()
-        manager._journal.list_all.return_value = ["tx-bad", "tx-good"]
+    async def test_recover_mv_orphan_both_paths(self, agfs_client, vector_store, test_dir):
+        """INIT mv operation → check both lock_paths and mv_dst_path for orphan locks."""
+        src_dir = f"{test_dir}/mv-orphan-src"
+        dst_dir = f"{test_dir}/mv-orphan-dst"
+        _mkdir_ok(agfs_client, src_dir)
+        _mkdir_ok(agfs_client, dst_dir)
 
-        def read_side_effect(tx_id):
-            if tx_id == "tx-bad":
-                raise Exception("corrupted journal")
-            return {
-                "id": "tx-good",
-                "status": "INIT",
-                "locks": [],
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "undo_log": [],
-                "post_actions": [],
-            }
+        tx_id = f"tx-mv-orphan-{uuid.uuid4().hex[:8]}"
+        src_lock = make_lock_file(agfs_client, src_dir, tx_id, "S")
+        dst_lock = make_lock_file(agfs_client, dst_dir, tx_id, "P")
 
-        manager._journal.read.side_effect = read_side_effect
-        manager._journal.delete = MagicMock()
+        journal = TransactionJournal(agfs_client)
+        record = TransactionRecord(
+            id=tx_id,
+            status=TransactionStatus.INIT,
+            locks=[],
+            init_info={
+                "operation": "mv",
+                "lock_paths": [src_dir],
+                "lock_mode": "mv",
+                "mv_dst_path": dst_dir,
+            },
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
 
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
         await manager._recover_pending_transactions()
 
-        # tx-good should still be cleaned up
-        manager._journal.delete.assert_called_once_with("tx-good")
+        # Both orphan locks should be cleaned up
+        assert not file_exists(agfs_client, src_lock)
+        assert not file_exists(agfs_client, dst_lock)
+        assert tx_id not in journal.list_all()
+
+    async def test_recover_multiple_transactions(self, agfs_client, vector_store, test_dir):
+        """Multiple journal entries are all recovered."""
+        dir_a = f"{test_dir}/multi-tx-a"
+        _mkdir_ok(agfs_client, dir_a)
+
+        journal = TransactionJournal(agfs_client)
+
+        # tx-a: EXEC with mkdir → should rollback
+        tx_a = f"tx-multi-a-{uuid.uuid4().hex[:8]}"
+        record_a = TransactionRecord(
+            id=tx_a,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": dir_a},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record_a)
+
+        # tx-b: COMMIT → no rollback, just cleanup
+        tx_b = f"tx-multi-b-{uuid.uuid4().hex[:8]}"
+        record_b = TransactionRecord(
+            id=tx_b,
+            status=TransactionStatus.COMMIT,
+            locks=[],
+            undo_log=[],
+            post_actions=[],
+        )
+        _write_journal(journal, record_b)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+        await manager._recover_pending_transactions()
+
+        assert not file_exists(agfs_client, dir_a)  # rolled back
+        assert tx_a not in journal.list_all()
+        assert tx_b not in journal.list_all()
+
+    async def test_recover_corrupted_journal_skips(self, agfs_client, vector_store, test_dir):
+        """Corrupted journal entry → skipped, others still processed."""
+        journal = TransactionJournal(agfs_client)
+
+        # Write a corrupted journal entry (invalid JSON)
+        bad_tx_id = f"tx-bad-{uuid.uuid4().hex[:8]}"
+        _mkdir_ok(agfs_client, "/local/_system")
+        _mkdir_ok(agfs_client, "/local/_system/transactions")
+        bad_dir = f"/local/_system/transactions/{bad_tx_id}"
+        _mkdir_ok(agfs_client, bad_dir)
+        agfs_client.write(f"{bad_dir}/journal.json", b"NOT VALID JSON {{{{")
+
+        # Write a good journal entry
+        good_dir = f"{test_dir}/good-recovery"
+        _mkdir_ok(agfs_client, good_dir)
+
+        good_tx_id = f"tx-good-{uuid.uuid4().hex[:8]}"
+        record = TransactionRecord(
+            id=good_tx_id,
+            status=TransactionStatus.EXEC,
+            locks=[],
+            undo_log=[
+                UndoEntry(
+                    sequence=0,
+                    op_type="fs_mkdir",
+                    params={"uri": good_dir},
+                    completed=True,
+                )
+            ],
+            post_actions=[],
+        )
+        _write_journal(journal, record)
+
+        manager = TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+        await manager._recover_pending_transactions()
+
+        # Good tx should still be recovered
+        assert not file_exists(agfs_client, good_dir)
+        assert good_tx_id not in journal.list_all()

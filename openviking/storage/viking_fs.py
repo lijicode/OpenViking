@@ -22,7 +22,6 @@ from datetime import datetime
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from openviking.pyagfs.exceptions import AGFSHTTPError
 from openviking.server.identity import RequestContext, Role
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.time_utils import format_simplified, get_current_timestamp, parse_iso_datetime
@@ -300,13 +299,6 @@ class VikingFS:
         target_uri = self._path_to_uri(path, ctx=ctx)
 
         tx_manager = get_transaction_manager()
-        if not tx_manager:
-            # Fallback: no transaction support
-            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
-            uris_to_delete.append(target_uri)
-            result = self.agfs.rm(path, recursive=recursive)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
-            return result
 
         # Check existence and determine lock strategy
         try:
@@ -381,19 +373,6 @@ class VikingFS:
         target_uri = self._path_to_uri(old_path, ctx=ctx)
 
         tx_manager = get_transaction_manager()
-        if not tx_manager:
-            # Fallback: no transaction support
-            uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
-            uris_to_move.append(target_uri)
-            try:
-                result = self.agfs.mv(old_path, new_path)
-                await self._update_vector_store_uris(uris_to_move, old_uri, new_uri, ctx=ctx)
-                return result
-            except AGFSHTTPError as e:
-                if e.status_code == 404:
-                    await self._delete_from_vector_store(uris_to_move, ctx=ctx)
-                    logger.info(f"[VikingFS] mv source not found, cleaned orphan index: {old_uri}")
-                raise
 
         # Verify source exists and determine type before locking
         try:
@@ -1228,9 +1207,9 @@ class VikingFS:
         for uri in uris:
             try:
                 records = await vector_store.get_context_by_uri(
-                    account_id=real_ctx.account_id,
                     uri=uri,
                     limit=10,
+                    ctx=real_ctx,
                 )
                 if records:
                     snapshots.extend(records)

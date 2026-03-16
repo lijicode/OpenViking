@@ -31,7 +31,7 @@ def _reconstruct_ctx(params: Dict[str, Any]) -> Optional[Any]:
         from openviking_cli.session.user_id import UserIdentifier
 
         role = Role(role_value) if role_value in {r.value for r in Role} else Role.ROOT
-        user = UserIdentifier(account_id, user_id, agent_id or "")
+        user = UserIdentifier(account_id, user_id, agent_id or "default")
         return RequestContext(user=user, role=role)
     except Exception as e:
         logger.warning(f"[Rollback] Failed to reconstruct ctx: {e}")
@@ -144,7 +144,11 @@ def _rollback_entry(
         if vector_store:
             record_id = params.get("record_id")
             if record_id:
-                run_async(vector_store.delete([record_id]))
+                restored_ctx = _reconstruct_ctx(params)
+                if restored_ctx:
+                    run_async(vector_store.delete([record_id], ctx=restored_ctx))
+                else:
+                    logger.warning("[Rollback] vectordb_upsert: cannot reconstruct ctx, skipping")
 
     elif op == "vectordb_delete":
         if vector_store:

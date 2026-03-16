@@ -251,25 +251,16 @@ class Session:
         archive_abstract = self._extract_abstract_from_summary(summary)
         archive_overview = summary
 
-        if tx_manager:
-            run_async(
-                self._phase1_archive_async(
-                    tx_manager,
-                    session_path,
-                    self._compression.compression_index,
-                    messages_to_archive,
-                    archive_abstract,
-                    archive_overview,
-                )
+        run_async(
+            self._phase1_archive_async(
+                tx_manager,
+                session_path,
+                self._compression.compression_index,
+                messages_to_archive,
+                archive_abstract,
+                archive_overview,
             )
-        else:
-            self._write_archive(
-                index=self._compression.compression_index,
-                messages=messages_to_archive,
-                abstract=archive_abstract,
-                overview=archive_overview,
-            )
-            self._write_to_agfs(messages=[])
+        )
 
         self._compression.original_count += len(messages_to_archive)
         result["archived"] = True
@@ -298,11 +289,7 @@ class Session:
             get_current_telemetry().set("memory.extracted", len(memories))
 
         # ===== Phase 2: Memory write =====
-        if tx_manager:
-            run_async(self._phase2_memory_async(tx_manager, session_path))
-        else:
-            self._write_to_agfs(self._messages)
-            self._write_relations()
+        run_async(self._phase2_memory_async(tx_manager, session_path))
 
         # Update active_count
         active_count_updated = self._update_active_counts()

@@ -629,12 +629,12 @@ def init_transaction_manager(
         return _transaction_manager
 
 
-def get_transaction_manager() -> Optional[TransactionManager]:
-    """Get transaction manager singleton.
-
-    Returns:
-        TransactionManager instance or None if not initialized
-    """
+def get_transaction_manager() -> TransactionManager:
+    """Get transaction manager singleton."""
+    if _transaction_manager is None:
+        raise RuntimeError(
+            "TransactionManager not initialized. Call init_transaction_manager() first."
+        )
     return _transaction_manager
 
 

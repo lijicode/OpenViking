@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared fixtures for transaction tests using real AGFS backend."""
+"""Shared fixtures for transaction tests using real AGFS and VectorDB backends."""
 
 import os
 import shutil
@@ -9,12 +9,23 @@ import uuid
 import pytest
 
 from openviking.agfs_manager import AGFSManager
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.collection_schemas import CollectionSchemas
+from openviking.storage.transaction.journal import TransactionJournal
+from openviking.storage.transaction.path_lock import LOCK_FILE_NAME, _make_fencing_token
+from openviking.storage.transaction.transaction_manager import TransactionManager
+from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 from openviking.utils.agfs_utils import create_agfs_client
+from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.agfs_config import AGFSConfig
+from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 AGFS_CONF = AGFSConfig(
     path="/tmp/ov-tx-test", backend="local", port=1834, url="http://localhost:1834", timeout=10
 )
+
+VECTOR_DIM = 4
+COLLECTION_NAME = "tx_test_ctx"
 
 # Clean slate before session starts
 if os.path.exists(AGFS_CONF.path):
@@ -54,3 +65,76 @@ def test_dir(agfs_client):
         agfs_client.rm(path, recursive=True)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# VectorDB fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def vector_store(tmp_path_factory):
+    """Session-scoped real local VectorDB backend."""
+    db_path = str(tmp_path_factory.mktemp("vectordb"))
+    config = VectorDBBackendConfig(
+        backend="local",
+        name=COLLECTION_NAME,
+        path=db_path,
+        dimension=VECTOR_DIM,
+    )
+    store = VikingVectorIndexBackend(config=config)
+
+    import asyncio
+
+    schema = CollectionSchemas.context_collection(COLLECTION_NAME, VECTOR_DIM)
+    asyncio.get_event_loop().run_until_complete(store.create_collection(COLLECTION_NAME, schema))
+
+    yield store
+
+    asyncio.get_event_loop().run_until_complete(store.close())
+
+
+@pytest.fixture(scope="session")
+def request_ctx():
+    """Session-scoped RequestContext for VectorDB operations."""
+    user = UserIdentifier("default", "test_user", "default")
+    return RequestContext(user=user, role=Role.ROOT)
+
+
+# ---------------------------------------------------------------------------
+# Transaction fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tx_manager(agfs_client, vector_store):
+    """Function-scoped TransactionManager with real backends."""
+    return TransactionManager(agfs_client=agfs_client, vector_store=vector_store)
+
+
+@pytest.fixture
+def journal(agfs_client):
+    """Function-scoped TransactionJournal with real AGFS backend."""
+    return TransactionJournal(agfs_client)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+
+def file_exists(agfs_client, path) -> bool:
+    """Check if a file/dir exists in AGFS."""
+    try:
+        agfs_client.stat(path)
+        return True
+    except Exception:
+        return False
+
+
+def make_lock_file(agfs_client, dir_path, tx_id, lock_type="P") -> str:
+    """Create a real lock file in AGFS and return its path."""
+    lock_path = f"{dir_path.rstrip('/')}/{LOCK_FILE_NAME}"
+    token = _make_fencing_token(tx_id, lock_type)
+    agfs_client.write(lock_path, token.encode("utf-8"))
+    return lock_path

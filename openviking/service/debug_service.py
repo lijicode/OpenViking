@@ -138,13 +138,14 @@ class ObserverService:
     @property
     def transaction(self) -> ComponentStatus:
         """Get transaction status."""
-        transaction_manager = get_transaction_manager()
-        if transaction_manager is None:
+        try:
+            transaction_manager = get_transaction_manager()
+        except Exception:
             return ComponentStatus(
                 name="transaction",
                 is_healthy=False,
                 has_errors=True,
-                status="Transaction manager not initialized.",
+                status="Not initialized",
             )
         observer = TransactionObserver(transaction_manager)
         return ComponentStatus(

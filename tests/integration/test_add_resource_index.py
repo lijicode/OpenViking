@@ -94,7 +94,6 @@ async def test_add_resource_indexing_logic(test_config, tmp_path):
         patch("openviking.utils.agfs_utils.create_agfs_client", return_value=mock_agfs),
         patch("openviking.agfs_manager.AGFSManager.start"),
         patch("openviking.agfs_manager.AGFSManager.stop"),
-        patch("openviking.storage.transaction.get_transaction_manager", return_value=None),
     ):
         mock_summarize.return_value = {"status": "success"}
 

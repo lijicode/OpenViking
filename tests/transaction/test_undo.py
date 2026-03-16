@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for undo log and rollback executor."""
 
-from unittest.mock import AsyncMock, MagicMock
+import uuid
 
 from openviking.storage.transaction.undo import UndoEntry, execute_rollback
+
+from .conftest import VECTOR_DIM, _mkdir_ok, file_exists
 
 
 class TestUndoEntry:
@@ -35,129 +37,213 @@ class TestUndoEntry:
 
 
 class TestExecuteRollback:
-    def test_rollback_fs_mv(self):
-        agfs = MagicMock()
+    """Integration tests for execute_rollback using real AGFS and VectorDB backends."""
+
+    def test_rollback_fs_mv(self, agfs_client, test_dir):
+        src = f"{test_dir}/src"
+        dst = f"{test_dir}/dst"
+        _mkdir_ok(agfs_client, src)
+        agfs_client.write(f"{src}/data.txt", b"hello")
+
+        # Forward: mv src → dst
+        agfs_client.mv(src, dst)
+        assert not file_exists(agfs_client, src)
+        assert file_exists(agfs_client, dst)
+
         undo_log = [
             UndoEntry(
-                sequence=0, op_type="fs_mv", params={"src": "/a", "dst": "/b"}, completed=True
+                sequence=0,
+                op_type="fs_mv",
+                params={"src": src, "dst": dst},
+                completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs)
-        agfs.mv.assert_called_once_with("/b", "/a")
+        execute_rollback(undo_log, agfs_client)
 
-    def test_rollback_fs_rm_skipped(self):
-        agfs = MagicMock()
+        # src restored, dst gone
+        assert file_exists(agfs_client, src)
+        assert not file_exists(agfs_client, dst)
+
+    def test_rollback_fs_rm_skipped(self, agfs_client, test_dir):
+        path = f"{test_dir}/will-not-delete"
+        _mkdir_ok(agfs_client, path)
+
         undo_log = [
-            UndoEntry(sequence=0, op_type="fs_rm", params={"uri": "/a"}, completed=True),
+            UndoEntry(sequence=0, op_type="fs_rm", params={"uri": path}, completed=True),
         ]
-        execute_rollback(undo_log, agfs)
-        agfs.mv.assert_not_called()
-        agfs.rm.assert_not_called()
+        execute_rollback(undo_log, agfs_client)
 
-    def test_rollback_fs_mkdir(self):
-        agfs = MagicMock()
+        # fs_rm rollback is a no-op; directory still exists
+        assert file_exists(agfs_client, path)
+
+    def test_rollback_fs_mkdir(self, agfs_client, test_dir):
+        new_dir = f"{test_dir}/created"
+        _mkdir_ok(agfs_client, new_dir)
+        assert file_exists(agfs_client, new_dir)
+
         undo_log = [
-            UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": "/a/b"}, completed=True),
+            UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=True),
         ]
-        execute_rollback(undo_log, agfs)
-        agfs.rm.assert_called_once_with("/a/b")
+        execute_rollback(undo_log, agfs_client)
 
-    def test_rollback_fs_write_new(self):
-        agfs = MagicMock()
+        assert not file_exists(agfs_client, new_dir)
+
+    def test_rollback_fs_write_new(self, agfs_client, test_dir):
+        file_path = f"{test_dir}/new-file.txt"
+        agfs_client.write(file_path, b"content")
+        assert file_exists(agfs_client, file_path)
+
         undo_log = [
             UndoEntry(
-                sequence=0, op_type="fs_write_new", params={"uri": "/a/f.txt"}, completed=True
+                sequence=0, op_type="fs_write_new", params={"uri": file_path}, completed=True
             ),
         ]
-        execute_rollback(undo_log, agfs)
-        agfs.rm.assert_called_once_with("/a/f.txt", recursive=True)
+        execute_rollback(undo_log, agfs_client)
 
-    def test_rollback_vectordb_upsert(self):
-        agfs = MagicMock()
-        vector_store = AsyncMock()
+        assert not file_exists(agfs_client, file_path)
+
+    def test_rollback_reverse_order(self, agfs_client, test_dir):
+        """mkdir parent + child → rollback → both removed in reverse order."""
+        parent = f"{test_dir}/parent"
+        child = f"{test_dir}/parent/child"
+        _mkdir_ok(agfs_client, parent)
+        _mkdir_ok(agfs_client, child)
+
+        undo_log = [
+            UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": parent}, completed=True),
+            UndoEntry(sequence=1, op_type="fs_mkdir", params={"uri": child}, completed=True),
+        ]
+        execute_rollback(undo_log, agfs_client)
+
+        # child removed first (seq=1), then parent (seq=0)
+        assert not file_exists(agfs_client, child)
+        assert not file_exists(agfs_client, parent)
+
+    def test_rollback_skips_incomplete(self, agfs_client, test_dir):
+        new_dir = f"{test_dir}/incomplete"
+        _mkdir_ok(agfs_client, new_dir)
+
+        undo_log = [
+            UndoEntry(sequence=0, op_type="fs_mkdir", params={"uri": new_dir}, completed=False),
+        ]
+        execute_rollback(undo_log, agfs_client)
+
+        # completed=False → not rolled back
+        assert file_exists(agfs_client, new_dir)
+
+    def test_rollback_best_effort(self, agfs_client, test_dir):
+        """A failing rollback entry should not prevent others from running."""
+        real_dir = f"{test_dir}/real-dir"
+        _mkdir_ok(agfs_client, real_dir)
+
+        src = f"{test_dir}/be-src"
+        dst = f"{test_dir}/be-dst"
+        _mkdir_ok(agfs_client, dst)
+
+        undo_log = [
+            # seq=0: fs_mv rollback will succeed
+            UndoEntry(sequence=0, op_type="fs_mv", params={"src": src, "dst": dst}, completed=True),
+            # seq=1: fs_mkdir rollback will fail (rm on non-empty or non-existent path)
+            UndoEntry(
+                sequence=1,
+                op_type="fs_mkdir",
+                params={"uri": f"{test_dir}/nonexistent-dir-xyz"},
+                completed=True,
+            ),
+        ]
+        # Should not raise
+        execute_rollback(undo_log, agfs_client)
+
+        # seq=0 mv rollback should have executed (dst → src)
+        assert file_exists(agfs_client, src)
+
+    async def test_rollback_vectordb_upsert(self, agfs_client, vector_store, request_ctx):
+        """Real upsert → rollback → record deleted."""
+        record_id = str(uuid.uuid4())
+        record = {
+            "id": record_id,
+            "uri": f"viking://resources/test-upsert-{record_id}.md",
+            "parent_uri": "viking://resources/",
+            "account_id": "default",
+            "context_type": "resource",
+            "level": 2,
+            "vector": [0.1] * VECTOR_DIM,
+            "name": "test",
+            "description": "test record",
+            "abstract": "test",
+        }
+        await vector_store.upsert(record, ctx=request_ctx)
+
+        # Confirm it exists
+        results = await vector_store.get([record_id], ctx=request_ctx)
+        assert len(results) == 1
+
         undo_log = [
             UndoEntry(
                 sequence=0,
                 op_type="vectordb_upsert",
-                params={"record_id": "r1"},
+                params={
+                    "record_id": record_id,
+                    "_ctx_account_id": "default",
+                    "_ctx_user_id": "test_user",
+                    "_ctx_role": "root",
+                },
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs, vector_store=vector_store)
-        vector_store.delete.assert_called_once_with(["r1"])
+        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
-    def test_rollback_vectordb_update_uri(self):
-        agfs = MagicMock()
-        ctx = MagicMock()
-        vector_store = AsyncMock()
+        results = await vector_store.get([record_id], ctx=request_ctx)
+        assert len(results) == 0
+
+    async def test_rollback_vectordb_update_uri(self, agfs_client, vector_store, request_ctx):
+        """Real upsert → update_uri_mapping → rollback → URI restored."""
+        record_id = str(uuid.uuid4())
+        old_uri = f"viking://resources/old-{record_id}.md"
+        new_uri = f"viking://resources/new-{record_id}.md"
+        record = {
+            "id": record_id,
+            "uri": old_uri,
+            "parent_uri": "viking://resources/",
+            "account_id": "default",
+            "context_type": "resource",
+            "level": 2,
+            "vector": [0.2] * VECTOR_DIM,
+            "name": "test",
+            "description": "test",
+            "abstract": "test",
+        }
+        await vector_store.upsert(record, ctx=request_ctx)
+
+        # Forward: update URI mapping
+        await vector_store.update_uri_mapping(
+            ctx=request_ctx,
+            uri=old_uri,
+            new_uri=new_uri,
+            new_parent_uri="viking://resources/",
+        )
+
+        # Verify forward operation
+        result = await vector_store.fetch_by_uri(new_uri, ctx=request_ctx)
+        assert result is not None
+
         undo_log = [
             UndoEntry(
                 sequence=0,
                 op_type="vectordb_update_uri",
                 params={
-                    "old_uri": "viking://a",
-                    "new_uri": "viking://b",
-                    "old_parent_uri": "viking://",
+                    "old_uri": old_uri,
+                    "new_uri": new_uri,
+                    "old_parent_uri": "viking://resources/",
+                    "_ctx_account_id": "default",
+                    "_ctx_user_id": "test_user",
+                    "_ctx_role": "root",
                 },
                 completed=True,
             ),
         ]
-        execute_rollback(undo_log, agfs, vector_store=vector_store, ctx=ctx)
-        vector_store.update_uri_mapping.assert_called_once_with(
-            ctx=ctx, uri="viking://b", new_uri="viking://a", new_parent_uri="viking://"
-        )
+        execute_rollback(undo_log, agfs_client, vector_store=vector_store)
 
-    def test_rollback_reverse_order(self):
-        """Rollback should process entries in reverse sequence order."""
-        agfs = MagicMock()
-        call_order = []
-        original_mv = agfs.mv
-        original_rm = agfs.rm
-
-        def track_mv(*args):
-            call_order.append(("mv", args))
-            return original_mv(*args)
-
-        def track_rm(*args, **kwargs):
-            call_order.append(("rm", args))
-            return original_rm(*args, **kwargs)
-
-        agfs.mv = track_mv
-        agfs.rm = track_rm
-
-        undo_log = [
-            UndoEntry(
-                sequence=0, op_type="fs_mv", params={"src": "/a", "dst": "/b"}, completed=True
-            ),
-            UndoEntry(sequence=1, op_type="fs_mkdir", params={"uri": "/c"}, completed=True),
-        ]
-        execute_rollback(undo_log, agfs)
-        # seq=1 should be rolled back first (mkdir→rm), then seq=0 (mv→reverse mv)
-        assert call_order[0][0] == "rm"
-        assert call_order[1][0] == "mv"
-
-    def test_rollback_skips_incomplete(self):
-        agfs = MagicMock()
-        undo_log = [
-            UndoEntry(
-                sequence=0, op_type="fs_mv", params={"src": "/a", "dst": "/b"}, completed=False
-            ),
-        ]
-        execute_rollback(undo_log, agfs)
-        agfs.mv.assert_not_called()
-
-    def test_rollback_best_effort(self):
-        """A failing rollback entry should not prevent others from running."""
-        agfs = MagicMock()
-        agfs.rm.side_effect = Exception("boom")
-        agfs.mv = MagicMock()
-
-        undo_log = [
-            UndoEntry(
-                sequence=0, op_type="fs_mv", params={"src": "/a", "dst": "/b"}, completed=True
-            ),
-            UndoEntry(sequence=1, op_type="fs_mkdir", params={"uri": "/c"}, completed=True),
-        ]
-        execute_rollback(undo_log, agfs)
-        # fs_mkdir rollback failed (rm raises), but fs_mv rollback should still run
-        agfs.mv.assert_called_once_with("/b", "/a")
+        # URI should be restored to old_uri
+        result = await vector_store.fetch_by_uri(old_uri, ctx=request_ctx)
+        assert result is not None
