@@ -323,6 +323,8 @@ class PathLock:
 
             backed_off = False
             conflict_after = await self._scan_descendants_for_locks(path, transaction_id)
+            if not conflict_after:
+                conflict_after = await self._check_ancestors_for_subtree(path, transaction_id)
             if conflict_after:
                 their_token = self._read_token(conflict_after)
                 if their_token:

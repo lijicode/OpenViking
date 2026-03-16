@@ -336,7 +336,9 @@ class Session:
         async with TransactionContext(
             tx_manager, "session_archive", [session_path], lock_mode="point"
         ) as tx:
-            seq = tx.record_undo("fs_write_new", {"uri": session_path})
+            archive_uri = f"{self._session_uri}/history/archive_{compression_index:03d}"
+            archive_path = self._viking_fs._uri_to_path(archive_uri, ctx=self.ctx)
+            seq = tx.record_undo("fs_write_new", {"uri": archive_path})
             self._write_archive(
                 index=compression_index,
                 messages=messages_to_archive,
@@ -355,11 +357,9 @@ class Session:
         async with TransactionContext(
             tx_manager, "session_memory", [session_path], lock_mode="point"
         ) as tx:
-            seq = tx.record_undo("fs_write_new", {"uri": session_path})
             self._write_to_agfs(self._messages)
             self._write_relations()
             self._write_checkpoint({"status": "completed"})
-            tx.mark_completed(seq)
             tx.add_post_action(
                 "enqueue_semantic",
                 {

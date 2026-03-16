@@ -15,6 +15,29 @@ from openviking_cli.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _reconstruct_ctx(params: Dict[str, Any]) -> Optional[Any]:
+    """Reconstruct a RequestContext from serialized _ctx_* fields in undo params.
+
+    Returns None if the required fields are missing.
+    """
+    account_id = params.get("_ctx_account_id")
+    user_id = params.get("_ctx_user_id")
+    agent_id = params.get("_ctx_agent_id")
+    role_value = params.get("_ctx_role")
+    if account_id is None or user_id is None:
+        return None
+    try:
+        from openviking.server.identity import RequestContext, Role
+        from openviking_cli.session.user_id import UserIdentifier
+
+        role = Role(role_value) if role_value in {r.value for r in Role} else Role.ROOT
+        user = UserIdentifier(account_id, user_id, agent_id or "")
+        return RequestContext(user=user, role=role)
+    except Exception as e:
+        logger.warning(f"[Rollback] Failed to reconstruct ctx: {e}")
+        return None
+
+
 @dataclass
 class UndoEntry:
     """A single undo log entry representing one reversible sub-operation.
@@ -124,24 +147,32 @@ def _rollback_entry(
                 run_async(vector_store.delete([record_id]))
 
     elif op == "vectordb_delete":
-        if vector_store and ctx:
-            records_snapshot = params.get("records_snapshot", [])
-            for record in records_snapshot:
-                try:
-                    run_async(vector_store.upsert(record))
-                except Exception as e:
-                    logger.warning(f"[Rollback] Failed to restore vector record: {e}")
+        if vector_store:
+            restored_ctx = _reconstruct_ctx(params)
+            if restored_ctx is None:
+                logger.warning("[Rollback] vectordb_delete: cannot reconstruct ctx, skipping")
+            else:
+                records_snapshot = params.get("records_snapshot", [])
+                for record in records_snapshot:
+                    try:
+                        run_async(vector_store.upsert(record, ctx=restored_ctx))
+                    except Exception as e:
+                        logger.warning(f"[Rollback] Failed to restore vector record: {e}")
 
     elif op == "vectordb_update_uri":
-        if vector_store and ctx:
-            run_async(
-                vector_store.update_uri_mapping(
-                    ctx=ctx,
-                    uri=params["new_uri"],
-                    new_uri=params["old_uri"],
-                    new_parent_uri=params.get("old_parent_uri", ""),
+        if vector_store:
+            restored_ctx = _reconstruct_ctx(params)
+            if restored_ctx is None:
+                logger.warning("[Rollback] vectordb_update_uri: cannot reconstruct ctx, skipping")
+            else:
+                run_async(
+                    vector_store.update_uri_mapping(
+                        ctx=restored_ctx,
+                        uri=params["new_uri"],
+                        new_uri=params["old_uri"],
+                        new_parent_uri=params.get("old_parent_uri", ""),
+                    )
                 )
-            )
 
     else:
         logger.warning(f"[Rollback] Unknown op_type: {op}")

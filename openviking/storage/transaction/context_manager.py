@@ -125,8 +125,8 @@ class TransactionContext:
 
         try:
             self._tx_manager.journal.update(self.record.to_journal())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Transaction] Failed to persist journal: {e}")
 
         return seq
 
@@ -138,8 +138,8 @@ class TransactionContext:
 
         try:
             self._tx_manager.journal.update(self.record.to_journal())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Transaction] Failed to persist journal: {e}")
 
     def add_post_action(self, action_type: str, params: Dict[str, Any]) -> None:
         self.record.post_actions.append({"type": action_type, "params": params})

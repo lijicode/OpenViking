@@ -298,12 +298,12 @@ class VikingFS:
         self._ensure_access(uri, ctx)
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
-        uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
-        uris_to_delete.append(target_uri)
 
         tx_manager = get_transaction_manager()
         if not tx_manager:
             # Fallback: no transaction support
+            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            uris_to_delete.append(target_uri)
             result = self.agfs.rm(path, recursive=recursive)
             await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
             return result
@@ -314,6 +314,8 @@ class VikingFS:
             is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
         except Exception:
             # Path does not exist: clean up any orphan index records and return
+            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            uris_to_delete.append(target_uri)
             await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
             logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
             return {}
@@ -327,12 +329,25 @@ class VikingFS:
             lock_mode = "point"
 
         async with TransactionContext(tx_manager, "rm", lock_paths, lock_mode=lock_mode) as tx:
+            # Collect URIs inside the lock to avoid race conditions
+            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            uris_to_delete.append(target_uri)
+
             # Snapshot vector records for rollback
             records_snapshot = await self._snapshot_vector_records(uris_to_delete, ctx=ctx)
 
             # Step 1: Delete from VectorDB first
+            real_ctx = self._ctx_or_default(ctx)
             seq_vdb = tx.record_undo(
-                "vectordb_delete", {"uris": uris_to_delete, "records_snapshot": records_snapshot}
+                "vectordb_delete",
+                {
+                    "uris": uris_to_delete,
+                    "records_snapshot": records_snapshot,
+                    "_ctx_account_id": real_ctx.account_id,
+                    "_ctx_user_id": real_ctx.user.user_id,
+                    "_ctx_agent_id": real_ctx.user.agent_id,
+                    "_ctx_role": real_ctx.role.value,
+                },
             )
             await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
             tx.mark_completed(seq_vdb)
@@ -364,12 +379,12 @@ class VikingFS:
         old_path = self._uri_to_path(old_uri, ctx=ctx)
         new_path = self._uri_to_path(new_uri, ctx=ctx)
         target_uri = self._path_to_uri(old_path, ctx=ctx)
-        uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
-        uris_to_move.append(target_uri)
 
         tx_manager = get_transaction_manager()
         if not tx_manager:
             # Fallback: no transaction support
+            uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
+            uris_to_move.append(target_uri)
             try:
                 result = self.agfs.mv(old_path, new_path)
                 await self._update_vector_store_uris(uris_to_move, old_uri, new_uri, ctx=ctx)
@@ -397,6 +412,10 @@ class VikingFS:
             mv_dst_path=dst_parent,
             src_is_dir=is_dir,
         ) as tx:
+            # Collect URIs inside the lock to avoid race conditions
+            uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
+            uris_to_move.append(target_uri)
+
             # Step 1: Copy source to destination
             seq_cp = tx.record_undo("fs_write_new", {"uri": new_path})
             try:
@@ -421,6 +440,7 @@ class VikingFS:
             old_parent_uri = (
                 old_uri_stripped.rsplit("/", 1)[0] + "/" if "/" in old_uri_stripped else ""
             )
+            real_ctx = self._ctx_or_default(ctx)
             seq_vdb = tx.record_undo(
                 "vectordb_update_uri",
                 {
@@ -428,6 +448,10 @@ class VikingFS:
                     "new_uri": new_uri,
                     "old_parent_uri": old_parent_uri,
                     "uris": uris_to_move,
+                    "_ctx_account_id": real_ctx.account_id,
+                    "_ctx_user_id": real_ctx.user.user_id,
+                    "_ctx_agent_id": real_ctx.user.agent_id,
+                    "_ctx_role": real_ctx.role.value,
                 },
             )
             await self._update_vector_store_uris(uris_to_move, old_uri, new_uri, ctx=ctx)
