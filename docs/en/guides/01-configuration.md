@@ -193,6 +193,8 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
   "embedding": {
     "max_concurrent": 10,
     "max_retries": 3,
+    "text_source": "content_only",
+    "max_input_tokens": 4096,
     "dense": {
       "provider": "volcengine",
       "api_key": "your-api-key",
@@ -210,6 +212,8 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 |-----------|------|-------------|
 | `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`) |
 | `max_retries` | int | Maximum retry attempts for transient embedding provider errors (`embedding.max_retries`, default: `3`; `0` disables retry) |
+| `text_source` | str | Text used for vectorizing text files. `content_only` reads raw content, `summary_first` uses summary when available and falls back to content, `summary_only` uses only summary. Default: `content_only` |
+| `max_input_tokens` | int | Maximum estimated raw text tokens sent to the embedding model when content is used. Default: `4096` |
 | `provider` | str | `"volcengine"`, `"openai"`, `"vikingdb"`, `"jina"`, `"voyage"`, `"dashscope"`, or `"gemini"` |
 | `api_key` | str | API key |
 | `model` | str | Model name |
@@ -723,6 +727,26 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
 
 If rerank is not configured, search uses vector similarity only.
 
+### retrieval
+
+Retrieval ranking configuration for final search scores.
+
+```json
+{
+  "retrieval": {
+    "hotness_alpha": 0.0,
+    "score_propagation_alpha": 0.5
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `hotness_alpha` | float | Weight for blending hotness into final retrieval scores. `0.0` disables the hotness boost and keeps scores equal to semantic similarity; `1.0` uses only hotness. Valid range: `0.0` to `1.0`. | `0.0` |
+| `score_propagation_alpha` | float | Weight for each child result's own score when blending with its parent score during hierarchical retrieval. `0.5` keeps the existing equal blend; `1.0` ignores the parent score; `0.0` uses only the parent score. Valid range: `0.0` to `1.0`. | `0.5` |
+
+Keep `hotness_alpha` at `0.0` when you need scores to reflect pure vector similarity. Set it above `0.0` only when frequently accessed or recently updated contexts should receive a ranking boost.
+
 ### storage
 
 Storage configuration for context data, including file storage (RAGFS) and vector database storage (VectorDB).
@@ -1140,6 +1164,8 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
   "embedding": {
     "max_concurrent": 10,
     "max_retries": 3,
+    "text_source": "content_only",
+    "max_input_tokens": 4096,
     "dense": {
       "provider": "volcengine",
       "api_key": "string",
@@ -1166,6 +1192,10 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "api_base": "string",
     "threshold": 0.1,
     "extra_headers": {}
+  },
+  "retrieval": {
+    "hotness_alpha": 0.0,
+    "score_propagation_alpha": 0.5
   },
   "encryption": {
     "enabled": false,
